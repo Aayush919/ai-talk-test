@@ -1,0 +1,44 @@
+# Secrets & local env
+.env
+.env.local
+.env.*.local
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime / generated audio & sessions
+sessions/
+*.wav
+*.mp3
+*.webm
+*.ogg
+*.m4a
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs & temp
+*.log
+tmp/
+temp/
+.cache/

@@ -1,0 +1,92 @@
+[
+  {
+    "id": "introduction",
+    "title": "Self Introduction",
+    "prompt": "Help the learner introduce themselves: name, city, work or studies, and one hobby.",
+    "starter": "Hi! Let's practice a self introduction. Tell me your name and a little about yourself."
+  },
+  {
+    "id": "family",
+    "title": "Family Talk",
+    "prompt": "Chat about family members, living situation, and weekend family habits.",
+    "starter": "Let's talk about family. Who do you live with, and what do you enjoy doing together?"
+  },
+  {
+    "id": "daily-routine",
+    "title": "Daily Routine",
+    "prompt": "Practice describing a normal day from morning to night using simple present tense.",
+    "starter": "Tell me about your daily routine. What do you usually do in the morning?"
+  },
+  {
+    "id": "job-interview",
+    "title": "Job Interview",
+    "prompt": "Run a friendly mock interview: strengths, experience, and why they want the role.",
+    "starter": "Welcome to your mock interview. Please introduce yourself and your background."
+  },
+  {
+    "id": "food-order",
+    "title": "Ordering Food",
+    "prompt": "Role-play restaurant ordering: menu questions, preferences, and polite requests.",
+    "starter": "Welcome! I'm your waiter today. What would you like to order?"
+  },
+  {
+    "id": "travel",
+    "title": "Travel & Directions",
+    "prompt": "Practice asking for directions, transport options, and travel plans.",
+    "starter": "You're visiting a new city. Ask me how to get to the train station."
+  },
+  {
+    "id": "shopping",
+    "title": "Shopping",
+    "prompt": "Practice shopping talk: sizes, prices, discounts, and polite bargaining.",
+    "starter": "You're in a clothing store. Tell me what you're looking for."
+  },
+  {
+    "id": "weather",
+    "title": "Weather Small Talk",
+    "prompt": "Light conversation about weather, seasons, and weekend plans.",
+    "starter": "How's the weather where you are today? Do you like this season?"
+  },
+  {
+    "id": "hobbies",
+    "title": "Hobbies",
+    "prompt": "Talk about hobbies, free time, and why those activities matter to the learner.",
+    "starter": "What do you like doing in your free time? Tell me about one hobby."
+  },
+  {
+    "id": "school-college",
+    "title": "School / College",
+    "prompt": "Discuss classes, teachers, exams, and campus life in natural English.",
+    "starter": "Let's talk about school or college. What are you studying these days?"
+  },
+  {
+    "id": "friends-plans",
+    "title": "Plans with Friends",
+    "prompt": "Practice making plans: time, place, activity, and confirming details.",
+    "starter": "Your friends want to meet this weekend. Suggest a plan to me."
+  },
+  {
+    "id": "phone-call",
+    "title": "Phone Call Practice",
+    "prompt": "Simulate a phone call: greeting, purpose, clarifying, and ending politely.",
+    "starter": "Ring ring — hello? This is your English coach on a practice call. Why are you calling?"
+  },
+  {
+    "id": "doctor",
+    "title": "Doctor Appointment",
+    "prompt": "Describe symptoms politely and answer a doctor's follow-up questions.",
+    "starter": "I'm the doctor. What health problem brings you in today?"
+  },
+  {
+    "id": "hotel-checkin",
+    "title": "Hotel Check-in",
+    "prompt": "Practice hotel check-in: reservation, ID, room requests, and amenities.",
+    "starter": "Welcome to the hotel front desk. Do you have a reservation with us?"
+  },
+  {
+    "id": "hometown",
+    "title": "Describe Your Hometown",
+    "prompt": "Describe hometown places, food, people, and what a visitor should see.",
+    "starter": "Tell me about your hometown. What should a visitor see first?"
+  }
+]
