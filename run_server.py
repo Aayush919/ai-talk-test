@@ -28,8 +28,9 @@ def main() -> None:
         raise SystemExit(1)
 
     print(f"[ai-talk] http://{host}:{port}")
-    print("[ai-talk] reload=OFF — stays up until Ctrl+C")
+    print("[ai-talk] reload=OFF - stays up until Ctrl+C")
     print("[ai-talk] seed=once-only (already done => skip)")
+    print("[ai-talk] debug log: logs/ai-talk.log  (per-call: logs/call-<session>.log)")
     uvicorn.run(
         "api.app:app",
         host=host,

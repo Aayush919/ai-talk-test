@@ -8,7 +8,7 @@
   {
     "id": "family",
     "title": "Family Talk",
-    "prompt": "Chat about family members, living situation, and weekend family habits.",
+    "prompt": "Ask about the learner's family members, who they live with, and what they enjoy together. Keep questions about THEM — do not invent your own family stories.",
     "starter": "Let's talk about family. Who do you live with, and what do you enjoy doing together?"
   },
   {

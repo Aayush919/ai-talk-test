@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from api.call_ws import LiveCallBridge
+from core import call_log
 from core.coach_service import CoachService
 from core.config import Settings, load_settings
 from core.session import Session, new_session
@@ -61,12 +62,13 @@ async def lifespan(_app: FastAPI):
             if n:
                 print(f"[api] topics seeded once: {n}")
             else:
-                print("[api] topics already seeded — skip")
+                print("[api] topics already seeded - skip")
         except Exception as exc:  # noqa: BLE001
             print(f"[api] topic seed skipped: {exc}")
 
     threading.Thread(target=_seed, daemon=True).start()
-    print("[api] ready — realtime only (no local audio files)")
+    print("[api] ready - realtime only (no local audio files)")
+    call_log.info("SERVER", f"ready log={call_log.log_path()}")
     yield
 
 
@@ -104,6 +106,15 @@ def start_session(body: StartSessionBody) -> dict[str, Any]:
     session = new_session(mode="live", mongo=STATE.mongo, topic=topic)
     opener = STATE.coach.open_session(session)
     STATE.sessions[session.session_id] = session
+    call_log.info(
+        "SESSION",
+        f"started topic={topic.id}",
+        session_id=session.session_id,
+        extra={
+            "topic": topic.id,
+            "tts_ms": (opener.latency or {}).get("tts_ms") if opener.latency else None,
+        },
+    )
     audio_b64 = (
         base64.b64encode(opener.coach_audio_bytes).decode("ascii")
         if opener.coach_audio_bytes
@@ -136,6 +147,7 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
             {"type": "error", "detail": "Session not found. Start a topic again."}
         )
         await websocket.close(code=4404)
+        call_log.error("CONNECT", "session not found", session_id=session_id)
         return
     bridge = LiveCallBridge(
         websocket=websocket,

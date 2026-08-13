@@ -38,6 +38,8 @@ Desktop.ini
 *.swo
 
 # Logs & temp
+logs/*.log
+logs/*.log.1
 *.log
 tmp/
 temp/

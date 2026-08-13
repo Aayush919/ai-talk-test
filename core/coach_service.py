@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 
 from core.session import Session
+from core.text_clean import clean_speech_text
 from core.tfidf_engine import TfidfEngine
 from wrappers.deepgram_tts import DeepgramTTS
 from wrappers.groq_llm import GroqCoach
@@ -51,20 +52,48 @@ def _norm(text: str) -> str:
     return " ".join(cleaned.split())
 
 
+_CLARIFY_CUES = (
+    "tell me again",
+    "say again",
+    "repeat",
+    "don't get",
+    "do not get",
+    "dont get",
+    "what do you mean",
+    "i don't understand",
+    "i dont understand",
+    "didn't understand",
+    "did not understand",
+    "confused",
+)
+
+
+def needs_fresh_reply(text: str) -> bool:
+    """Skip speculative reuse when user asks to clarify — must answer exactly."""
+    t = _norm(text)
+    if not t:
+        return False
+    if len(t.split()) <= 2 and t in {"yeah", "yes", "ok", "okay", "i", "huh", "what"}:
+        return True
+    return any(cue in t for cue in _CLARIFY_CUES)
+
+
 def transcripts_compatible(partial: str, final: str) -> bool:
-    """Reuse speculative prep when final is close enough to what we prepared on."""
+    """Reuse speculative prep only when final is basically the same utterance."""
     a, b = _norm(partial), _norm(final)
     if not a or not b:
         return False
+    if needs_fresh_reply(final):
+        return False
     if a == b:
         return True
-    if b.startswith(a) or a.startswith(b):
-        return True
+    # Small extension only — big new content must rebuild from full speech
+    if b.startswith(a):
+        extra = len(b.split()) - len(a.split())
+        return extra <= 2
     wa, wb = a.split(), b.split()
-    if len(wa) >= 3 and " ".join(wa[:3]) == " ".join(wb[:3]):
-        return True
-    if len(wa) >= 4 and " ".join(wa[-4:]) in b:
-        return True
+    if len(wa) >= 5 and len(wb) >= 5 and " ".join(wa[:5]) == " ".join(wb[:5]):
+        return abs(len(wa) - len(wb)) <= 2
     return False
 
 
@@ -94,7 +123,7 @@ class CoachService:
         session.add("assistant", starter)
         session.turn = 0
         t0 = time.perf_counter()
-        audio = self.tts.speak_bytes(starter)
+        audio = self.tts.speak_bytes(clean_speech_text(starter))
         tts_ms = int((time.perf_counter() - t0) * 1000)
         self._persist_async(
             session.session_id,
@@ -117,13 +146,20 @@ class CoachService:
         text = (user_text or "").strip()
         history_texts = [m["content"] for m in session.messages]
         keywords = self.tfidf.extract(history_texts, text)
-        history = session.snapshot() + [{"role": "user", "content": text}]
+        # Light grounding — don't force robotic "You said X" echoes
+        grounded = (
+            f"{text}\n"
+            "(Respond naturally to this line. Do not invent facts. "
+            "If they asked you something, answer briefly as AI Talk.)"
+        )
+        history = session.snapshot() + [{"role": "user", "content": grounded}]
         t_llm = time.perf_counter()
         coach_text = (
             self.coach.reply(history, keywords, topic=session.topic) or ""
         ).strip()
+        coach_text = clean_speech_text(coach_text)
         if not coach_text:
-            coach_text = "Nice — tell me a bit more. What else?"
+            coach_text = "Nice - tell me a bit more. What else?"
         return DraftReply(
             user_text=text,
             coach_text=coach_text,
@@ -138,10 +174,14 @@ class CoachService:
         *,
         speculative: bool = False,
     ) -> PreparedReply:
-        """Full prep for speculative reuse (LLM + full TTS buffer)."""
+        """Speculative: LLM + TTS of first speak-chunk only (faster ready)."""
+        from wrappers.deepgram_tts import split_speak_chunks
+
         draft = self.draft_reply(session, user_text)
+        units = split_speak_chunks(draft.coach_text)
+        speak_now = units[0] if units else draft.coach_text
         t0 = time.perf_counter()
-        audio = self.tts.speak_bytes(draft.coach_text)
+        audio = self.tts.speak_bytes(speak_now)
         tts_ms = int((time.perf_counter() - t0) * 1000)
         return PreparedReply(
             user_text=draft.user_text,

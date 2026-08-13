@@ -26,11 +26,35 @@ let audioCtx = null;
 let processor = null;
 let inCall = false;
 let coachPlaying = false;
+let coachStartedAt = 0;
 let playToken = 0;
 let objectUrl = null;
 let wantCall = false; // user wants call to stay up
 let pingTimer = null;
 let reconnectTimer = null;
+
+function micRms(float32) {
+  let sum = 0;
+  for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+  return Math.sqrt(sum / Math.max(1, float32.length));
+}
+
+function clientLog(level, name, detail, fields) {
+  // Console only on connect — never send a log packet that can drop the live line
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN && name !== "ws_open") {
+      ws.send(JSON.stringify({
+        type: "client_log",
+        level,
+        name,
+        detail: String(detail || ""),
+        fields: fields || {},
+      }));
+    }
+  } catch {}
+  if (level === "error") console.error("[call]", name, detail);
+  else console.log("[call]", name, detail || "", fields || "");
+}
 
 function showLatency(lat) {
   if (!els.latency || !lat) return;
@@ -44,8 +68,13 @@ function showLatency(lat) {
 }
 
 let pcmPlayer = null;
+let pcmEndTimer = null;
 
 function stopPcmStream() {
+  if (pcmEndTimer) {
+    clearTimeout(pcmEndTimer);
+    pcmEndTimer = null;
+  }
   if (pcmPlayer) {
     try { pcmPlayer.stop(); } catch {}
     pcmPlayer = null;
@@ -53,8 +82,10 @@ function stopPcmStream() {
 }
 
 function startPcmStream(sampleRate = 16000) {
+  // Hard-cut previous coach voice so only the new reply plays
   stopPcmStream();
   playToken += 1;
+  const myToken = playToken;
   try {
     els.player.pause();
     els.player.removeAttribute("src");
@@ -67,9 +98,12 @@ function startPcmStream(sampleRate = 16000) {
   const ctx = new AudioContext({ sampleRate });
   let nextTime = 0;
   let stopped = false;
+  const activeSources = new Set();
   pcmPlayer = {
+    token: myToken,
     push(arrayBuffer) {
-      if (stopped || !arrayBuffer || arrayBuffer.byteLength < 2) return;
+      if (stopped || myToken !== playToken) return;
+      if (!arrayBuffer || arrayBuffer.byteLength < 2) return;
       const len = arrayBuffer.byteLength - (arrayBuffer.byteLength % 2);
       const i16 = new Int16Array(arrayBuffer.slice(0, len));
       const f32 = new Float32Array(i16.length);
@@ -81,18 +115,39 @@ function startPcmStream(sampleRate = 16000) {
       src.connect(ctx.destination);
       const now = ctx.currentTime;
       if (nextTime < now + 0.02) nextTime = now + 0.02;
-      src.start(nextTime);
+      try {
+        src.start(nextTime);
+      } catch {
+        return;
+      }
       nextTime += buf.duration;
+      activeSources.add(src);
+      src.onended = () => activeSources.delete(src);
+    },
+    /** ms of coach audio still scheduled (PCM arrives fast; play is slower) */
+    remainingMs() {
+      if (stopped) return 0;
+      try {
+        return Math.max(0, (nextTime - ctx.currentTime) * 1000);
+      } catch {
+        return 0;
+      }
     },
     stop() {
       stopped = true;
+      for (const src of activeSources) {
+        try { src.stop(0); } catch {}
+        try { src.disconnect(); } catch {}
+      }
+      activeSources.clear();
       try { ctx.close(); } catch {}
     },
   };
   if (ctx.state === "suspended") ctx.resume().catch(() => {});
   coachPlaying = true;
+  coachStartedAt = Date.now();
   setCallUi("Coach speaking… (you can interrupt)");
-  setStatus("Coach speaking — streaming…");
+  setStatus("Coach speaking — bol ke interrupt kar sakte ho.");
   return pcmPlayer;
 }
 
@@ -169,6 +224,7 @@ async function playCoachAudio({ b64, url, blob }) {
   playToken += 1;
   const token = playToken;
   coachPlaying = true;
+  coachStartedAt = Date.now();
   try {
     els.player.pause();
   } catch {}
@@ -310,9 +366,13 @@ async function startMicStream() {
   processor = audioCtx.createScriptProcessor(2048, 1, 1);
   processor.onaudioprocess = (event) => {
     if (!inCall || !ws || ws.readyState !== WebSocket.OPEN) return;
-    // Mute uplink while coach speaks — stops echo from cancelling TTS
-    if (coachPlaying) return;
     const input = event.inputBuffer.getChannelData(0);
+    // While coach talks: allow loud user speech (barge-in), ignore quiet echo
+    if (coachPlaying) {
+      const age = Date.now() - coachStartedAt;
+      if (age < 850) return;
+      if (micRms(input) < 0.04) return;
+    }
     const down = downsample(input, audioCtx.sampleRate, 16000);
     ws.send(floatTo16BitPCM(down));
   };
@@ -355,7 +415,8 @@ async function joinCall() {
     ws.onmessage = async (event) => {
       // Binary: either one-shot WAV after audio_binary_next, or PCM stream chunks
       if (event.data instanceof ArrayBuffer) {
-        if (pcmPlayer) {
+        // Ignore leftover PCM from an older cancelled turn
+        if (pcmPlayer && pcmPlayer.token === playToken) {
           pcmPlayer.push(event.data);
           return;
         }
@@ -380,26 +441,55 @@ async function joinCall() {
 
       if (msg.type === "barge_in") {
         stopCoachAudio();
+        setCallUi("Listening — talk naturally");
         setStatus("Interrupted — listening to you…");
       }
 
       if (msg.type === "partial" && msg.text) {
-        // Do NOT stop coach audio on partials — speaker echo was killing TTS
         els.partial.textContent = msg.is_final ? "" : `Hearing: ${msg.text}`;
       }
 
       if (msg.type === "thinking") {
+        // Cut any still-playing previous coach voice before next reply
+        stopCoachAudio();
         setCallUi("Thinking…");
         setStatus("Coach preparing a short reply…");
+        console.log("[call] thinking");
+        if (window.__thinkWatch) clearTimeout(window.__thinkWatch);
+        window.__thinkWatch = setTimeout(() => {
+          if (inCall) {
+            console.warn("[call] still Thinking after 8s — check server [calldbg] logs");
+            setStatus("Still thinking… if stuck, check server logs for [calldbg]");
+          }
+        }, 8000);
+      }
+
+      if (msg.type === "diag") {
+        console.warn("[call] diag:", msg.detail);
+        setStatus(msg.detail || "diag");
       }
 
       if (msg.type === "prep") {
         setStatus("Prefetching reply while you speak…");
+        console.log("[call] prep", msg.text);
       }
 
       if (msg.type === "prep_ready" && msg.latency) {
-        showLatency({ ...msg.latency, wait_ms: "…", speculative: true, mode: "spec" });
-        setStatus("Reply ready — waiting for you to finish…");
+        showLatency({ ...msg.latency, wait_ms: "…", speculative: true, mode: "pipeline" });
+        setStatus("LLM ready — warming Deepgram audio…");
+      }
+
+      if (msg.type === "prep_audio_ready") {
+        const ms = msg.buffered_ms != null ? `${msg.buffered_ms}ms` : "…";
+        setStatus(`Audio buffered (${ms}) — finish speaking for instant reply`);
+        showLatency({
+          wait_ms: "…",
+          llm_ms: "…",
+          ttfb_ms: 0,
+          tts_ms: msg.buffered_ms || 0,
+          speculative: true,
+          mode: "audio_ready",
+        });
       }
 
       if (msg.type === "user_final") {
@@ -408,14 +498,18 @@ async function joinCall() {
       }
 
       if (msg.type === "coach_turn") {
+        if (window.__thinkWatch) clearTimeout(window.__thinkWatch);
+        console.log("[call] coach_turn", msg.mode || "", (msg.coach_text || "").slice(0, 80));
         if (msg.latency) showLatency(msg.latency);
         if (msg.stream && msg.audio_format === "pcm_s16le") {
           addBubble("assistant", msg.coach_text);
           showKeywords(msg.keywords);
+          // Always hard-stop previous audio, then start only this reply
           startPcmStream(msg.sample_rate || 16000);
           return;
         }
         if (msg.audio_binary_next) {
+          stopCoachAudio();
           pendingBinaryAudio = msg;
           return;
         }
@@ -425,21 +519,44 @@ async function joinCall() {
       }
 
       if (msg.type === "coach_audio_end") {
+        if (window.__thinkWatch) clearTimeout(window.__thinkWatch);
+        console.log("[call] coach_audio_end", msg.latency);
         if (msg.latency) showLatency(msg.latency);
-        // Keep mic muted briefly so tail audio isn't echoed into STT
-        setTimeout(() => {
+        // PCM bytes arrive fast; Web Audio still has the full sentence queued.
+        // Wait for remaining playback — do NOT mute halfway.
+        const endToken = playToken;
+        const remain = pcmPlayer && pcmPlayer.token === endToken
+          ? pcmPlayer.remainingMs()
+          : 0;
+        const waitMs = Math.min(Math.max(remain + 120, 400), 12000);
+        clientLog("info", "audio_drain", "waiting to finish sentence", {
+          remain_ms: Math.round(remain),
+          wait_ms: waitMs,
+          mode: (msg.latency && msg.latency.mode) || "",
+          hear_ms: msg.latency && (msg.latency.wait_ms ?? msg.latency.total_ms),
+          llm_ms: msg.latency && msg.latency.llm_ms,
+          ttfb_ms: msg.latency && msg.latency.ttfb_ms,
+          tts_ms: msg.latency && msg.latency.tts_ms,
+        });
+        if (pcmEndTimer) clearTimeout(pcmEndTimer);
+        pcmEndTimer = setTimeout(() => {
+          if (playToken !== endToken) return;
           coachPlaying = false;
-          pcmPlayer = null;
+          if (pcmPlayer && pcmPlayer.token === endToken) {
+            // Soft cleanup after full sentence finished playing
+            stopPcmStream();
+          }
           if (inCall) {
             setCallUi("Listening — talk naturally");
             setStatus("Live call on. Speak anytime.");
           }
-        }, 1200);
+        }, waitMs);
       }
 
       if (msg.type === "error") {
         setStatus(msg.detail || "Call error");
         setCallUi(inCall ? "Listening — talk naturally" : "Call error");
+        clientLog("error", "server_error", msg.detail || "Call error");
       }
       if (msg.type === "info") setStatus(msg.detail || "Call info");
       if (msg.type === "call_ready") setStatus(msg.message || "Call ready");
@@ -451,22 +568,27 @@ async function joinCall() {
         clearInterval(pingTimer);
         pingTimer = null;
       }
+      // Don't hammer reconnect — one retry after a short pause
       if (wantCall && sessionId) {
         setCallUi("Reconnecting…");
-        setStatus("Line dropped — reconnecting…");
+        setStatus("Line dropped — reconnecting once…");
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = setTimeout(() => {
           if (wantCall) joinCall();
-        }, 1000);
+        }, 1500);
       } else {
         setCallUi("Call ended — tap Join Call to reconnect");
         setStatus("Call ended.");
       }
     };
 
-    ws.onerror = () => setStatus("WebSocket error — retrying…");
+    ws.onerror = () => {
+      setStatus("WebSocket error — retrying…");
+      clientLog("error", "ws_error", "websocket error");
+    };
   } catch (err) {
     setStatus(err.message || "Mic / call failed");
+    clientLog("error", "join_fail", err.message || "Mic / call failed");
     if (wantCall) {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(() => joinCall(), 1000);

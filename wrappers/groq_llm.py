@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from groq import Groq
 
+from core import call_log
 from core.keys import KeyPool
 from core.prompts import build_system_prompt
 from core.topics import Topic
@@ -46,16 +47,20 @@ class GroqCoach:
 
         def _once(api_key: str) -> str:
             # Short context = faster TTFT
-            trimmed = messages[:1] + messages[1:][-6:]
+            trimmed = messages[:1] + messages[1:][-8:]
             kwargs: dict = {
                 "model": self.model,
                 "messages": trimmed,
-                "temperature": 0.4,
-                "max_completion_tokens": 96,
+                "temperature": 0.45,
+                "max_completion_tokens": 72,
             }
             if "gpt-oss" in self.model:
                 kwargs["reasoning_effort"] = "low"
-            completion = self._client(api_key).chat.completions.create(**kwargs)
+            try:
+                completion = self._client(api_key).chat.completions.create(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                call_log.error("LLM", str(exc), extra={"model": self.model})
+                raise
             msg = completion.choices[0].message
             return (getattr(msg, "content", None) or "").strip()
 
