@@ -46,6 +46,7 @@ class DeepgramTTS:
         self._keys = keys
         self.model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         self._http: httpx.AsyncClient | None = None
+        self._speed_ok = True
 
     @property
     def _is_flux(self) -> bool:
@@ -62,14 +63,22 @@ class DeepgramTTS:
             return "https://api.deepgram.com/v2/speak"
         return "https://api.deepgram.com/v1/speak"
 
-    def _model_params(self, model: str) -> dict[str, str]:
-        # No speed param — Flux/some Aura voices reject it with HTTP 400
-        return {
+    def _model_params(self, model: str, *, use_speed: bool = True) -> dict[str, str]:
+        params = {
             "model": model,
             "encoding": "linear16",
             "sample_rate": "16000",
             "container": "none",
         }
+        speed = (os.getenv("DEEPGRAM_TTS_SPEED") or "0.90").strip()
+        if (
+            use_speed
+            and self._speed_ok
+            and speed
+            and not model.lower().startswith("flux-")
+        ):
+            params["speed"] = speed
+        return params
 
     def _candidates(self) -> list[str]:
         models = [self.model]
@@ -96,31 +105,41 @@ class DeepgramTTS:
         def _once(api_key: str) -> bytes:
             last_err: Exception | None = None
             for model in self._candidates():
-                try:
-                    with httpx.Client(timeout=30.0) as client:
-                        with client.stream(
-                            "POST",
-                            self._model_url(model),
-                            params=self._model_params(model),
-                            headers=self._headers(api_key),
-                            json={"text": clean},
-                        ) as resp:
-                            if resp.status_code >= 400:
-                                body = resp.read()
-                                raise RuntimeError(
-                                    f"Deepgram TTS {resp.status_code}: {body[:200]!r}"
-                                )
-                            data = b"".join(resp.iter_bytes())
-                    if not data:
-                        raise RuntimeError("Deepgram TTS returned empty audio")
-                    if model != self.model:
-                        print(f"[tts] fallback model={model}")
-                        self.model = model
-                    return self.pcm_to_wav(data)
-                except Exception as exc:  # noqa: BLE001
-                    last_err = exc
-                    print(f"[tts] model={model} fail: {exc}")
-                    call_log.error("TTS", str(exc), extra={"model": model})
+                for use_speed in (True, False):
+                    if use_speed and not self._speed_ok:
+                        continue
+                    try:
+                        with httpx.Client(timeout=30.0) as client:
+                            with client.stream(
+                                "POST",
+                                self._model_url(model),
+                                params=self._model_params(model, use_speed=use_speed),
+                                headers=self._headers(api_key),
+                                json={"text": clean},
+                            ) as resp:
+                                if resp.status_code >= 400:
+                                    body = resp.read()
+                                    err = RuntimeError(
+                                        f"Deepgram TTS {resp.status_code}: {body[:200]!r}"
+                                    )
+                                    if use_speed and resp.status_code == 400:
+                                        self._speed_ok = False
+                                        print("[tts] speed rejected — retrying without speed")
+                                        last_err = err
+                                        continue
+                                    raise err
+                                data = b"".join(resp.iter_bytes())
+                        if not data:
+                            raise RuntimeError("Deepgram TTS returned empty audio")
+                        if model != self.model:
+                            print(f"[tts] fallback model={model}")
+                            self.model = model
+                        return self.pcm_to_wav(data)
+                    except Exception as exc:  # noqa: BLE001
+                        last_err = exc
+                        print(f"[tts] model={model} fail: {exc}")
+                        call_log.error("TTS", str(exc), extra={"model": model})
+                        break
             raise RuntimeError(str(last_err) if last_err else "TTS failed")
 
         return self._keys.run(_once)
@@ -133,32 +152,41 @@ class DeepgramTTS:
 
         last_err: Exception | None = None
         for model in self._candidates():
-            try:
-                api_key = self._keys.pick()
-                client = await self._client()
-                async with client.stream(
-                    "POST",
-                    self._model_url(model),
-                    params=self._model_params(model),
-                    headers=self._headers(api_key),
-                    json={"text": clean},
-                ) as resp:
-                    if resp.status_code >= 400:
-                        body = await resp.aread()
-                        raise RuntimeError(
-                            f"Deepgram TTS {resp.status_code}: {body[:200]!r}"
-                        )
-                    if model != self.model:
-                        print(f"[tts] stream fallback model={model}")
-                        self.model = model
-                    async for chunk in resp.aiter_bytes(chunk_size=1024):
-                        if chunk:
-                            yield chunk
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-                print(f"[tts] stream model={model} fail: {exc}")
-                call_log.error("TTS", f"stream fail: {exc}", extra={"model": model})
+            for attempt in (1, 2):
+                try:
+                    api_key = self._keys.pick()
+                    client = await self._client()
+                    async with client.stream(
+                        "POST",
+                        self._model_url(model),
+                        params=self._model_params(model),
+                        headers=self._headers(api_key),
+                        json={"text": clean},
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            body = await resp.aread()
+                            if self._speed_ok and resp.status_code == 400:
+                                self._speed_ok = False
+                                print("[tts] stream speed rejected — retrying without speed")
+                                continue
+                            raise RuntimeError(
+                                f"Deepgram TTS {resp.status_code}: {body[:200]!r}"
+                            )
+                        if model != self.model:
+                            print(f"[tts] stream fallback model={model}")
+                            self.model = model
+                        async for chunk in resp.aiter_bytes(chunk_size=1024):
+                            if chunk:
+                                yield chunk
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    transient = "disconnected" in str(exc).lower()
+                    print(f"[tts] stream model={model} fail: {exc}")
+                    call_log.error("TTS", f"stream fail: {exc}", extra={"model": model})
+                    if transient and attempt == 1:
+                        continue
+                    break
         raise RuntimeError(str(last_err) if last_err else "TTS stream failed")
 
     async def stream_pcm_chunked(self, text: str) -> AsyncIterator[bytes]:

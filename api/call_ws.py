@@ -71,6 +71,31 @@ def _transcript_from_results(message: ListenV1Results) -> str:
     return (getattr(alts[0], "transcript", None) or "").strip()
 
 
+def _peak_16le(chunk: bytes, bridge: Any) -> None:
+    """Cheap loudness probe — tells a muted mic apart from a missing mic."""
+    if bridge._audio_bytes > 400_000:  # ~12s of audio is plenty to judge
+        return
+    peak = bridge._audio_peak
+    for i in range(0, len(chunk) - 1, 64):
+        sample = int.from_bytes(chunk[i : i + 2], "little", signed=True)
+        if sample < 0:
+            sample = -sample
+        if sample > peak:
+            peak = sample
+    bridge._audio_peak = peak
+
+
+def _same_utterance(prev: str, nxt: str) -> bool:
+    """True if nxt continues prev — not a second thought glued onto pending STT."""
+    a, b = _norm(prev), _norm(nxt)
+    if not a or not b:
+        return True
+    if b.startswith(a) or a.startswith(b):
+        return True
+    overlap = set(a.split()[-5:]) & set(b.split()[:6])
+    return len(overlap) >= 2
+
+
 class LiveCallBridge:
     """
     Looping pipeline while user speaks:
@@ -101,6 +126,8 @@ class LiveCallBridge:
         self._closed = False
         self._speaking = False
         self._speak_started_at = 0.0
+        self._speak_until = 0.0
+        self._hold_task: asyncio.Task[None] | None = None
         self._dg = None
         self._last_partial = ""
         self._spec_debounce: asyncio.Task[None] | None = None
@@ -110,6 +137,14 @@ class LiveCallBridge:
         self._barge_task: asyncio.Task[None] | None = None
         self._last_event = "init"
         self._turn_started_at = 0.0
+        # Silence lifecycle: quiet 10s -> warn, quiet 30s more -> hang up
+        self._idle_warn_s = 10.0
+        self._idle_end_s = 30.0
+        self._silence_at = time.perf_counter()
+        self._warned = False
+        self._audio_bytes = 0
+        self._audio_peak = 0
+        self._mic_flagged = False
 
     def _sid(self) -> str:
         return getattr(self.session, "session_id", "") or ""
@@ -117,8 +152,10 @@ class LiveCallBridge:
     def _dbg(self, msg: str) -> None:
         """Console + logs/ai-talk.log + logs/call-<sid>.log"""
         self._last_event = msg
-        level = "error" if any(
-            w in msg.upper() for w in ("FAIL", "ERROR", "STUCK", "WARN")
+        upper = msg.upper()
+        level = "error" if (
+            any(w in upper for w in ("FAIL", "STUCK", "WARN"))
+            or ("ERROR" in upper and "CANCELLEDERROR" not in upper)
         ) else "info"
         writer = call_log.error if level == "error" else call_log.info
         writer("CALL", msg, session_id=self._sid())
@@ -187,6 +224,137 @@ class LiveCallBridge:
                 call_log.warn("HEARTBEAT", stuck.strip(), session_id=self._sid())
             print(f"[calldbg] HEARTBEAT{stuck} | {self._state_line()}")
 
+    def _touch_voice(self) -> None:
+        self._silence_at = time.perf_counter()
+        self._warned = False
+
+    async def _idle_watch(self) -> None:
+        """Learner quiet 10s -> one warning; quiet 30s after that -> end the call."""
+        while not self._closed:
+            await asyncio.sleep(0.5)
+            if self._closed:
+                return
+            busy = self._coach_busy() or bool(
+                self._turn_task and not self._turn_task.done()
+            )
+            if busy:
+                # Coach audio / thinking is not learner silence — restart the clock
+                self._silence_at = time.perf_counter()
+                continue
+            quiet = time.perf_counter() - self._silence_at
+            if not self._mic_flagged and quiet >= 5.0:
+                self._mic_flagged = True
+                if self._audio_bytes == 0:
+                    call_log.warn(
+                        "MIC",
+                        "no audio bytes from browser in first 5s",
+                        session_id=self._sid(),
+                    )
+                    await self.send_json(
+                        {"type": "info", "detail": "No mic audio reaching the server."}
+                    )
+                elif self._audio_peak < 300:
+                    call_log.warn(
+                        "MIC",
+                        "audio arriving but nearly silent — check input device",
+                        session_id=self._sid(),
+                        extra={
+                            "bytes": self._audio_bytes,
+                            "peak": self._audio_peak,
+                        },
+                    )
+                    await self.send_json(
+                        {
+                            "type": "info",
+                            "detail": "Mic audio is silent — wrong input device?",
+                        }
+                    )
+                else:
+                    call_log.info(
+                        "MIC",
+                        "audio ok but no transcript yet",
+                        session_id=self._sid(),
+                        extra={
+                            "bytes": self._audio_bytes,
+                            "peak": self._audio_peak,
+                        },
+                    )
+            limit = self._idle_end_s if self._warned else self._idle_warn_s
+            if quiet < limit:
+                continue
+            if not self._warned:
+                self._warned = True
+                self._dbg(
+                    f"silence warn after {quiet:.1f}s "
+                    f"(mic bytes={self._audio_bytes} peak={self._audio_peak})"
+                )
+                await self._speak_line(
+                    "Are you still there? I'll wait thirty more seconds, "
+                    "otherwise I'll end the call."
+                )
+                self._silence_at = time.perf_counter()
+            else:
+                self._dbg(f"silence end after {quiet:.1f}s")
+                await self._end_for_silence()
+                return
+
+    async def _speak_line(self, line: str) -> None:
+        """Speak a system line (silence warning) on the live stream protocol."""
+        self._generation += 1
+        generation = self._generation
+        self._speaking = True
+        self._speak_started_at = time.perf_counter()
+        try:
+            await self.send_json(
+                {
+                    "type": "coach_turn",
+                    "turn": self.session.turn,
+                    "user_text": "",
+                    "coach_text": line,
+                    "keywords": [],
+                    "stream": True,
+                    "audio_format": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "mode": "system",
+                }
+            )
+            async for chunk in self.coach.tts.stream_pcm_chunked(line):
+                if self._closed or generation != self._generation:
+                    return
+                try:
+                    await self.ws.send_bytes(chunk)
+                except Exception:
+                    break
+            await self.send_json({"type": "coach_audio_end", "latency": {"mode": "system"}})
+        except Exception as exc:  # noqa: BLE001
+            self._dbg(f"system line failed: {exc}")
+        finally:
+            if generation == self._generation:
+                self._hold_playback(line)
+            else:
+                self._speaking = False
+
+    async def _end_for_silence(self) -> None:
+        await self._speak_line("No answer, so I'm ending the call. Talk to you soon!")
+        await asyncio.sleep(max(0.0, self._speak_until - time.perf_counter()))
+        call_log.info(
+            "DISCONNECT",
+            "ended on silence",
+            session_id=self._sid(),
+            extra={"warn_s": self._idle_warn_s, "end_s": self._idle_end_s},
+        )
+        await self.send_json({"type": "call_ended", "reason": "silence"})
+        self._closed = True
+        try:
+            await self._audio_q.put(None)
+        except Exception:
+            pass
+        try:
+            if self.ws.client_state == WebSocketState.CONNECTED:
+                await self.ws.close(code=1000)
+        except Exception:
+            pass
+
     async def send_json(self, payload: dict[str, Any]) -> None:
         if self.ws.client_state != WebSocketState.CONNECTED or self._closed:
             return
@@ -208,6 +376,7 @@ class LiveCallBridge:
         recv_task = asyncio.create_task(self._recv_browser(), name="recv")
         dg_task = asyncio.create_task(self._deepgram_loop(), name="deepgram")
         hb_task = asyncio.create_task(self._heartbeat(), name="heartbeat")
+        idle_task = asyncio.create_task(self._idle_watch(), name="idle")
         call_log.info(
             "CONNECT",
             "live call connected",
@@ -236,7 +405,8 @@ class LiveCallBridge:
                 self._turn_task.cancel()
             hb_task.cancel()
             dg_task.cancel()
-            await asyncio.gather(dg_task, hb_task, return_exceptions=True)
+            idle_task.cancel()
+            await asyncio.gather(dg_task, hb_task, idle_task, return_exceptions=True)
             try:
                 await self.coach.tts.aclose()
             except Exception:
@@ -261,6 +431,8 @@ class LiveCallBridge:
 
             data = message.get("bytes")
             if data:
+                self._audio_bytes += len(data)
+                _peak_16le(data, self)
                 try:
                     self._audio_q.put_nowait(data)
                 except asyncio.QueueFull:
@@ -449,12 +621,31 @@ class LiveCallBridge:
         if self._spec_debounce and not self._spec_debounce.done():
             self._spec_debounce.cancel()
 
+    def _coach_busy(self) -> bool:
+        return self._speaking or time.perf_counter() < self._speak_until
+
+    def _hold_playback(self, text: str = "", pcm_bytes: int = 0) -> None:
+        """Keep _speaking True while browser still plays flushed PCM (barge still works)."""
+        ms = int(pcm_bytes / 32) if pcm_bytes else max(700, len((text or "").split()) * 260)
+        hold = min(ms / 1000.0, 7.0) + 0.2
+        self._speaking = True
+        self._speak_until = time.perf_counter() + hold
+        if self._hold_task and not self._hold_task.done():
+            self._hold_task.cancel()
+
+        async def _release() -> None:
+            await asyncio.sleep(hold)
+            if time.perf_counter() >= self._speak_until - 0.05:
+                self._speaking = False
+
+        self._hold_task = asyncio.create_task(_release())
+
     def _kick_speculative(self, text: str) -> None:
         """Progressive embed: as learner speaks, rebuild reply from live STT text."""
         words = text.split()
-        if len(words) < 2:
+        if len(words) < 3:
             return
-        if self._speaking:
+        if self._coach_busy():
             return
         if self._turn_task and not self._turn_task.done():
             return
@@ -466,32 +657,23 @@ class LiveCallBridge:
         if self._spec and _norm(self._spec.source) == _norm(text):
             return
 
-        # Progressive rebuild: every +2 new words, re-embed from latest speech
+        # Don't thrash: only rebuild after +4 new words (was +2)
         if self._spec and _norm(text).startswith(_norm(self._spec.source)):
             old_n = len(self._spec.source.split())
-            new_n = len(words)
-            grew = new_n - old_n
-            if grew < 2:
+            grew = len(words) - old_n
+            if grew < 4:
                 return
-            # If first audio unit almost ready and only +2 words, let it finish
-            if (
-                grew <= 2
-                and self._spec.audio_ready
-                and not self._spec.done
-                and self._spec_task
-                and not self._spec_task.done()
-            ):
+            if self._spec_task and not self._spec_task.done():
                 return
 
         async def _debounced() -> None:
-            await asyncio.sleep(0.10)
-            if self._closed or self._speaking:
+            await asyncio.sleep(0.22)
+            if self._closed or self._coach_busy():
                 return
             if self._turn_task and not self._turn_task.done():
                 return
             if needs_fresh_reply(text):
                 return
-            # Capture latest pending-ish text at fire time
             live = text
             token = self._spec_token + 1
             self._spec_token = token
@@ -713,7 +895,7 @@ class LiveCallBridge:
         return ttfb_ms
     async def _barge_in(self, reason: str = "", interrupt_text: str = "") -> None:
         """Stop coach audio when user clearly starts speaking over it."""
-        if not self._speaking:
+        if not self._coach_busy():
             return
         age = time.perf_counter() - self._speak_started_at
         if age < self._barge_grace_s:
@@ -722,6 +904,9 @@ class LiveCallBridge:
 
         self._generation += 1
         self._speaking = False
+        self._speak_until = 0.0
+        if self._hold_task and not self._hold_task.done():
+            self._hold_task.cancel()
         self._cancel_spec()
         if self._turn_task and not self._turn_task.done():
             self._turn_task.cancel()
@@ -748,6 +933,7 @@ class LiveCallBridge:
         if isinstance(message, ListenV1Results):
             text = _transcript_from_results(message)
             if text:
+                self._touch_voice()
                 await self.send_json(
                     {
                         "type": "partial",
@@ -765,7 +951,7 @@ class LiveCallBridge:
                     )
 
                 # Interrupt only on committed speech (not noisy partials / echo)
-                if self._speaking:
+                if self._coach_busy():
                     words = text.split()
                     if (
                         (message.is_final or message.speech_final)
@@ -778,11 +964,20 @@ class LiveCallBridge:
                     return
 
                 if not message.speech_final:
-                    live = f"{self._pending} {text}".strip() if self._pending else text
+                    live = text
+                    if self._pending and _same_utterance(self._pending, text):
+                        live = f"{self._pending} {text}".strip()
                     self._kick_speculative(live)
 
                 if message.is_final:
-                    self._pending = f"{self._pending} {text}".strip()
+                    if self._pending and not _same_utterance(self._pending, text):
+                        self._dbg(
+                            f"stt new utterance replace "
+                            f"{self._pending[:40]!r} -> {text[:40]!r}"
+                        )
+                        self._pending = text
+                    else:
+                        self._pending = f"{self._pending} {text}".strip()
                     self._dbg(f"stt is_final pending={self._pending[:60]!r}")
                 if message.speech_final and self._pending:
                     self._dbg(f"stt speech_final -> schedule pending={self._pending[:60]!r}")
@@ -792,7 +987,7 @@ class LiveCallBridge:
         if (
             isinstance(message, ListenV1UtteranceEnd)
             and self._pending
-            and not self._speaking
+            and not self._coach_busy()
         ):
             self._dbg(f"stt utterance_end -> schedule pending={self._pending[:60]!r}")
             self._schedule_turn()
@@ -827,6 +1022,13 @@ class LiveCallBridge:
         await self.send_json({"type": "thinking"})
         self._dbg(f"turn thinking gen={generation}")
         try:
+            mem = getattr(self.session, "memory", None)
+            if mem:
+                mem.observe_user(text, self.session.turn + 1)
+                self._dbg(
+                    f"memory observe semantic={mem.fact_card()[:80]} "
+                    f"goal={mem.next_goal()}"
+                )
             # Clarifications must hit a fresh LLM answer (no wrong speculative story)
             snap = None
             if needs_fresh_reply(text):
@@ -842,6 +1044,19 @@ class LiveCallBridge:
                         f"turn snap units_done={snap.units_done} "
                         f"pcm={len(snap.pcm)} done={snap.done}"
                     )
+
+            # Short user line + rambling 4-unit buffer ("No. No.") → first unit only
+            if (
+                snap is not None
+                and len(text.split()) <= 3
+                and len(snap.units) > 2
+            ):
+                snap.units = snap.units[:1]
+                snap.coach_text = snap.units[0]
+                snap.pcm = b""
+                snap.units_done = 0
+                snap.done = True
+                self._dbg("turn cap ramble: short user, first unit only")
 
             if snap is not None and snap.pcm and snap.units_done >= 1:
                 # Pipeline HIT — at least one speak-unit fully buffered; flush now
@@ -904,7 +1119,10 @@ class LiveCallBridge:
                     )
                     self._dbg(f"turn PIPE HIT done hear@{heard_after}ms")
                 finally:
-                    self._speaking = False
+                    if generation == self._generation:
+                        self._hold_playback(snap.coach_text, pcm_bytes=len(snap.pcm))
+                    else:
+                        self._speaking = False
 
             elif snap is not None and snap.coach_text:
                 # LLM ready, audio not yet — stream TTS now
@@ -968,7 +1186,10 @@ class LiveCallBridge:
                     )
                     self._dbg(f"turn PIPE LLM done hear@{heard_after}ms")
                 finally:
-                    self._speaking = False
+                    if generation == self._generation:
+                        self._hold_playback(snap.coach_text)
+                    else:
+                        self._speaking = False
             else:
                 # Cold path: LLM then sentence-chunk TTS
                 self._dbg("turn cold LLM start")
@@ -1044,22 +1265,35 @@ class LiveCallBridge:
                     )
                     self._dbg(f"turn FRESH done hear@{heard_after}ms")
                 finally:
-                    self._speaking = False
+                    if generation == self._generation:
+                        self._hold_playback(draft.coach_text)
+                    else:
+                        self._speaking = False
 
             if self._queued.strip() and generation == self._generation:
                 queued = self._queued.strip()
                 self._queued = ""
-                self._pending = queued
-                self._dbg(f"drain queued -> {queued[:60]!r}")
-                self._schedule_turn()
+                wait = max(0.0, self._speak_until - time.perf_counter())
+                self._dbg(f"drain queued in {wait:.2f}s -> {queued[:60]!r}")
+
+                async def _drain_later() -> None:
+                    await asyncio.sleep(wait)
+                    if self._closed or generation != self._generation:
+                        return
+                    self._pending = queued
+                    self._schedule_turn()
+
+                asyncio.create_task(_drain_later())
             else:
                 self._dbg("turn idle listening")
         except asyncio.CancelledError:
             self._speaking = False
+            self._speak_until = 0.0
             self._dbg(f"turn CANCELLED gen={generation}")
             raise
         except Exception as exc:  # noqa: BLE001
             self._speaking = False
+            self._speak_until = 0.0
             print(f"[call] turn error: {exc}")
             self._dbg(f"turn ERROR: {exc}")
             if generation == self._generation:

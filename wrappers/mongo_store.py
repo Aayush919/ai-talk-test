@@ -28,11 +28,23 @@ class MongoStore:
         self.sessions: Collection = self._db["sessions"]
         self.topics: Collection = self._db["topics"]
         self.meta: Collection = self._db["meta"]
+        self.learner_profiles: Collection = self._db["learner_profiles"]
+        self.learner_vectors: Collection = self._db["learner_vectors"]
         try:
             self.sessions.create_index("session_id", unique=True)
             self.topics.create_index("id", unique=True)
         except Exception:
             # Index creation can wait; don't block app boot
+            pass
+
+    def ensure_memory_indexes(self) -> None:
+        try:
+            self.learner_profiles.create_index("learner_id", unique=True)
+            self.learner_vectors.create_index("learner_id")
+            self.learner_vectors.create_index(
+                [("learner_id", 1), ("doc_id", 1)], unique=True
+            )
+        except Exception:
             pass
 
     def seed_topics(self, *, force: bool = False) -> int:
@@ -154,3 +166,70 @@ class MongoStore:
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         return self.sessions.find_one({"session_id": session_id}, {"_id": 0})
+
+    def get_learner_profile(self, learner_id: str) -> dict[str, Any] | None:
+        return self.learner_profiles.find_one({"learner_id": learner_id}, {"_id": 0})
+
+    def upsert_learner_profile(self, learner_id: str, facts: dict[str, str]) -> None:
+        if not learner_id or not facts:
+            return
+        self.learner_profiles.update_one(
+            {"learner_id": learner_id},
+            {
+                "$set": {"facts": facts, "updated_at": _utc_now()},
+                "$setOnInsert": {"learner_id": learner_id, "created_at": _utc_now()},
+            },
+            upsert=True,
+        )
+
+    def upsert_learner_vector(
+        self,
+        *,
+        learner_id: str,
+        doc_id: str,
+        text: str,
+        kind: str,
+        vector: list[float],
+        extra: dict[str, Any],
+    ) -> None:
+        self.learner_vectors.update_one(
+            {"learner_id": learner_id, "doc_id": doc_id},
+            {
+                "$set": {
+                    "text": text,
+                    "kind": kind,
+                    "vector": vector,
+                    "extra": extra,
+                    "updated_at": _utc_now(),
+                },
+                "$setOnInsert": {"created_at": _utc_now()},
+            },
+            upsert=True,
+        )
+
+    def query_learner_vectors(
+        self, learner_id: str, query_vec: list[float], top_k: int = 5
+    ) -> list[str]:
+        """Per-user cosine — O(this learner's docs), not O(all users)."""
+        import numpy as np
+
+        rows = list(
+            self.learner_vectors.find(
+                {"learner_id": learner_id},
+                {"_id": 0, "text": 1, "vector": 1},
+            ).limit(80)
+        )
+        if not rows:
+            return []
+        q = np.array(query_vec, dtype=float)
+        scored: list[tuple[float, str]] = []
+        qn = float(np.linalg.norm(q)) or 1e-9
+        for row in rows:
+            vec = row.get("vector") or []
+            if not vec:
+                continue
+            v = np.array(vec, dtype=float)
+            denom = qn * (float(np.linalg.norm(v)) or 1e-9)
+            scored.append((float(np.dot(q, v) / denom), str(row.get("text") or "")))
+        scored.sort(reverse=True)
+        return [t for _, t in scored[:top_k] if t]

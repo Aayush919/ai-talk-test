@@ -1,0 +1,93 @@
+[
+  {
+    "id": "intro",
+    "title": "Introduction",
+    "about": "introducing yourself",
+    "teach": "Help them introduce themselves. Model sentence: My name is ____. I am from ____.",
+    "slots": ["name"],
+    "questions": [
+      "What is your name?",
+      "Where are you from?",
+      "Tell me one thing about yourself."
+    ],
+    "follow_ups": [
+      "Nice to meet you. Where are you from?",
+      "Tell me one thing about yourself."
+    ]
+  },
+  {
+    "id": "why_english",
+    "title": "Why English",
+    "about": "why you want to learn English",
+    "teach": "Help them say why they want English. Model: I want to learn English because ____.",
+    "slots": ["english_goal"],
+    "questions": [
+      "Why do you want to learn English?",
+      "Where do you need English in real life?"
+    ],
+    "follow_ups": [
+      "What kind of job do you want?",
+      "Where do you need English for that?"
+    ]
+  },
+  {
+    "id": "daily_routine",
+    "title": "Daily routine",
+    "about": "your daily routine",
+    "teach": "Help them describe a normal day in simple present. Model: I wake up at ____. Then I ____.",
+    "slots": ["routine"],
+    "questions": [
+      "What do you usually do in the morning?",
+      "What does a normal day look like for you?"
+    ],
+    "follow_ups": [
+      "What do you do after that?",
+      "What time do you usually start your day?"
+    ]
+  },
+  {
+    "id": "family",
+    "title": "Family",
+    "about": "your family",
+    "teach": "Help them talk about family simply. Model: I live with my ____.",
+    "slots": ["family"],
+    "questions": [
+      "Who do you live with?",
+      "Who do you spend time with at home?"
+    ],
+    "follow_ups": [
+      "Tell me one thing about them.",
+      "What do you like doing together?"
+    ]
+  },
+  {
+    "id": "work_study",
+    "title": "Job or study",
+    "about": "your work or studies",
+    "teach": "Help them talk about work or studies. Model: I am a ____. / I work as a ____. / I study ____.",
+    "slots": ["job"],
+    "questions": [
+      "Do you work or study?",
+      "What do you do during the day for work or college?"
+    ],
+    "follow_ups": [
+      "What do you like about that?",
+      "What is one thing you do there every day?"
+    ]
+  },
+  {
+    "id": "hobbies",
+    "title": "Hobbies",
+    "about": "your hobbies",
+    "teach": "Help them talk about free time. Model: In my free time I like ____.",
+    "slots": ["hobby"],
+    "questions": [
+      "What do you like doing in your free time?",
+      "What do you enjoy after work or class?"
+    ],
+    "follow_ups": [
+      "How often do you do that?",
+      "What do you like most about it?"
+    ]
+  }
+]

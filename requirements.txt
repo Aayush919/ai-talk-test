@@ -12,3 +12,5 @@ cloudinary>=1.41.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
+# optional 100k-user vector index (empty PINECONE_API_KEY uses Mongo per-learner vectors)
+# pinecone>=5.0.0

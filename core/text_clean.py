@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
+_STAGE = re.compile(
+    r"\([^)]*(?:smil|laugh|grin|pause|sigh|chuckl)[^)]*\)",
+    re.I,
+)
+_RECAP_ASK = re.compile(
+    r"\b(do you know|tell me about me|what do you know|say it together|"
+    r"put it (?:all )?together|practice saying)\b",
+    re.I,
+)
 
 _TRANSLATE = str.maketrans(
     {
@@ -27,6 +38,31 @@ def clean_speech_text(text: str) -> str:
     if not text:
         return ""
     return " ".join(str(text).translate(_TRANSLATE).split())
+
+
+def clip_spoken_reply(text: str, *, user_text: str = "") -> str:
+    """Short spoken default; allow a bit more only when they ask for recap/practice."""
+    raw = _STAGE.sub(" ", clean_speech_text(text))
+    raw = " ".join(raw.split())
+    if not raw:
+        return ""
+    allow_long = bool(_RECAP_ASK.search(user_text or ""))
+    has_fix = bool(
+        re.search(r'"[^"]{6,}"', raw)
+        or re.search(r"\b(we don't say|say it like this|try it)\b", raw, re.I)
+    )
+    max_words = 44 if (allow_long or has_fix) else 28
+    parts = re.split(r"(?<=[.!?])\s+", raw)
+    keep = parts[:4] if (allow_long or has_fix) else parts[:2]
+    out = " ".join(p.strip() for p in keep if p.strip())
+    words = out.split()
+    if len(words) <= max_words:
+        return out
+    cut = words[:max_words]
+    joined = " ".join(cut)
+    if not joined.endswith((".", "?", "!")):
+        joined += "."
+    return joined
 
 
 def safe_print(*args: object, **kwargs: object) -> None:

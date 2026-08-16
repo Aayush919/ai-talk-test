@@ -85,9 +85,11 @@ def write(
         _rotate_if_needed(MAIN_LOG)
         with MAIN_LOG.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+            fh.flush()
         if session_id:
             with session_log_path(session_id).open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+                fh.flush()
 
     try:
         print(line)

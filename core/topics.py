@@ -41,9 +41,22 @@ def load_topics() -> tuple[Topic, ...]:
     )
 
 
+_ALIASES = {
+    "free-talk": "free-talk",
+    "free_talk": "free-talk",
+    "freetalk": "free-talk",
+    "free": "free-talk",
+    "default": "free-talk",
+    "general": "free-talk",
+    "casual": "free-talk",
+}
+
+
 def get_topic(topic_id: str) -> Topic:
     matched = {t.id: t for t in load_topics()}
-    topic = matched.get(topic_id)
+    raw = (topic_id or "").strip().lower().replace("_", "-")
+    key = _ALIASES.get(raw, raw)
+    topic = matched.get(key) or matched.get("free-talk") or matched.get("introduction")
     if topic is None:
         known = ", ".join(sorted(matched))
         raise KeyError(f"Unknown topic={topic_id!r}. Known: {known}")

@@ -3,29 +3,25 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 import base64
 import threading
 
 from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from api.call_ws import LiveCallBridge
 from core import call_log
 from core.coach_service import CoachService
 from core.config import Settings, load_settings
+from core.memory.vector import VectorMemory
 from core.session import Session, new_session
 from core.tfidf_engine import TfidfEngine
 from core.topics import get_topic, list_topics
 from wrappers.deepgram_tts import DeepgramTTS
-from wrappers.groq_llm import GroqCoach
+from wrappers.llm import build_llm
 from wrappers.mongo_store import MongoStore
-
-ROOT = Path(__file__).resolve().parent.parent
 
 
 class AppState:
@@ -39,11 +35,17 @@ STATE = AppState()
 
 
 def _build_coach(settings: Settings, mongo: MongoStore) -> CoachService:
+    llm = build_llm(settings)
+    print(
+        f"[api] llm provider={settings.llm_provider} "
+        f"model={settings.sarvam_model if settings.llm_provider == 'sarvam' else settings.groq_model}"
+    )
     return CoachService(
         tts=DeepgramTTS(settings.deepgram_tts_keys),
-        coach=GroqCoach(settings.groq_keys, settings.groq_model),
+        coach=llm,
         tfidf=TfidfEngine(top_k=6),
         mongo=mongo,
+        vectors=VectorMemory(mongo),
     )
 
 
@@ -83,7 +85,8 @@ app.add_middleware(
 
 
 class StartSessionBody(BaseModel):
-    topic_id: str = Field(..., examples=["introduction"])
+    topic_id: str | None = None
+    learner_id: str = ""
 
 
 @app.get("/api/health")
@@ -99,11 +102,16 @@ def topics() -> dict[str, Any]:
 @app.post("/api/sessions")
 def start_session(body: StartSessionBody) -> dict[str, Any]:
     try:
-        topic = get_topic(body.topic_id)
+        topic = get_topic(body.topic_id or "free-talk")
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    session = new_session(mode="live", mongo=STATE.mongo, topic=topic)
+    session = new_session(
+        mode="live",
+        mongo=STATE.mongo,
+        topic=topic,
+        learner_id=body.learner_id,
+    )
     opener = STATE.coach.open_session(session)
     STATE.sessions[session.session_id] = session
     call_log.info(
@@ -112,6 +120,7 @@ def start_session(body: StartSessionBody) -> dict[str, Any]:
         session_id=session.session_id,
         extra={
             "topic": topic.id,
+            "learner_id": session.learner_id,
             "tts_ms": (opener.latency or {}).get("tts_ms") if opener.latency else None,
         },
     )
@@ -144,7 +153,7 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
     if session is None:
         await websocket.accept()
         await websocket.send_json(
-            {"type": "error", "detail": "Session not found. Start a topic again."}
+            {"type": "error", "detail": "Session not found. Start a session again."}
         )
         await websocket.close(code=4404)
         call_log.error("CONNECT", "session not found", session_id=session_id)
@@ -158,30 +167,12 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
     await bridge.run()
 
 
-frontend_dir = ROOT / "frontend"
-if frontend_dir.exists():
-
-    @app.get("/")
-    def index_page() -> FileResponse:
-        return FileResponse(
-            frontend_dir / "index.html",
-            headers={"Cache-Control": "no-cache"},
-        )
-
-    @app.get("/app.js")
-    def app_js() -> FileResponse:
-        return FileResponse(
-            frontend_dir / "app.js",
-            media_type="application/javascript",
-            headers={"Cache-Control": "no-cache"},
-        )
-
-    @app.get("/styles.css")
-    def styles_css() -> FileResponse:
-        return FileResponse(
-            frontend_dir / "styles.css",
-            media_type="text/css",
-            headers={"Cache-Control": "no-cache"},
-        )
-
-    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+@app.get("/")
+def root() -> dict[str, str]:
+    return {
+        "service": "ai-talk",
+        "mode": "api",
+        "health": "/api/health",
+        "sessions": "/api/sessions",
+        "call": "/ws/call/{session_id}",
+    }
