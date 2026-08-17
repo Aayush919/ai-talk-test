@@ -730,6 +730,48 @@ def test_spoken_hobbies_are_remembered_across_later_turns():
     assert repo.writes["progress"] == 0
 
 
+def test_call_chat_context_keeps_early_answers_in_the_live_prompt():
+    from core.conversation.chat_context import CallChatContext, MAX_CALL_CHARS
+    from core.conversation.prompts import build_generate_user_prompt
+
+    messages = []
+    for index in range(12):
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"What time do you wake up on day {index}?",
+            }
+        )
+        messages.append({"role": "user", "content": f"I wake up at 5:30 on day {index}."})
+    prompt = build_generate_user_prompt(
+        {
+            "topicTitle": "Daily routine",
+            "currentGoalId": "wake_up",
+            "recentMessages": messages,
+        },
+        "Do you remember what time I wake up?",
+    )
+    assert "This call (do not re-ask anything already answered here):" in prompt
+    assert "I wake up at 5:30 on day 0." in prompt
+    assert "I wake up at 5:30 on day 11." in prompt
+    assert "Covered this call:" in prompt
+
+    long_ctx = CallChatContext.from_runtime(
+        [
+            {"role": "assistant", "content": "What time do you wake up?"},
+            {"role": "user", "content": "I wake up at 5:30."},
+        ]
+        + [
+            {"role": "user", "content": ("yoga " * 80) + str(i)}
+            for i in range(40)
+        ]
+    )
+    kept, covered = long_ctx.for_llm()
+    assert kept
+    assert sum(len(item["content"]) for item in kept) <= MAX_CALL_CHARS + 80
+    assert any("5:30" in item for item in covered)
+
+
 def test_ack_turns_are_low_content_but_real_facts_are_not():
     from core.conversation.engagement import is_low_content_turn
 

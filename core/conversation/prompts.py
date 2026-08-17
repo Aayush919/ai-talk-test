@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.conversation.chat_context import CallChatContext
 from core.conversation.live_facts import covered_goal_keys
 from core.semantic.retrieval import compact_memory_context
 
-LIVE_RECENT_MESSAGES = 8
+LIVE_RECENT_MESSAGES = 8  # fallback alias; live path uses CallChatContext
 LIVE_MEMORY_ITEMS = 5
 LIVE_PROFILE_FACTS = 10
 LIVE_ASKED_QUESTIONS = 12
@@ -18,12 +19,13 @@ You are a friendly English speaking coach in a live voice call.
 Have a natural conversation while helping the learner practice the current topic and goal.
 
 Rules:
+- This call's conversation is ground truth. If they already answered something, do not ask it again.
 - Speak naturally. Usually 1-3 short sentences.
 - Ask at most one meaningful follow-up when useful.
 - Respond to what they just said. Do not sound like a questionnaire.
 - Do not repeat a question listed as already asked, even with different wording.
 - If a learner fact is already known, do not ask for it again. Acknowledge it and move to the next remaining goal.
-- If they ask whether you remember something, answer from Already known. Do not ask them to repeat it.
+- If they ask whether you remember something, answer from this call's conversation and Already known.
 - Yeah, okay, and short acknowledgements are not a request for a new question.
 - Use relevant learner context naturally. Never say you have a memory or a stored profile.
 - Do not announce internals.
@@ -125,11 +127,12 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
         )
         if line
     ]
-    recent = [
-        item
-        for item in (state.get("recentMessages") or [])
-        if isinstance(item, dict) and _trim(item.get("content"))
-    ][-LIVE_RECENT_MESSAGES:]
+    utterance = _trim(user_text)
+    chat = CallChatContext.from_runtime(
+        state.get("recentMessages") or [],
+        current_user=utterance,
+    )
+    recent, covered_qa = chat.for_llm()
     asked = _asked_for_prompt(state.get("recentQuestions") or [])
     entities = [
         str(item) for item in (state.get("lastMentionedEntities") or []) if str(item).strip()
@@ -155,12 +158,19 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
     level = _trim(state.get("topicLevel"))
     phase = _trim(state.get("conversationPhase")) or "START"
     engagement = _trim(state.get("userEngagement")) or "NORMAL"
-    utterance = _trim(user_text)
 
     lines = [
         f"Current topic: {title}" + (f" ({level})" if level else ""),
-        f"Current goal: {current_goal}",
     ]
+    if recent:
+        lines.append("This call (do not re-ask anything already answered here):")
+        for item in recent:
+            role = _trim(item.get("role")) or "user"
+            lines.append(f"{role}: {_trim(item.get('content'))}")
+    if covered_qa:
+        lines.append("Covered this call:")
+        lines.extend(f"- {item}" for item in covered_qa)
+    lines.append(f"Current goal: {current_goal}")
     if remaining:
         labels = "; ".join(_trim(item.get("description")) or item["key"] for item in remaining)
         lines.append(f"Remaining goals: {labels}")
@@ -178,14 +188,9 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
         lines.extend(f"- {item}" for item in asked)
     if entities:
         lines.append("Recent entities: " + ", ".join(entities))
-    if recent:
-        lines.append("Recent conversation:")
-        for item in recent:
-            role = _trim(item.get("role")) or "user"
-            lines.append(f"{role}: {_trim(item.get('content'))}")
     if utterance:
         lines.append(f"User just said: {utterance}")
-    else:
+    elif not recent:
         lines.append(
             "The call is starting. Greet warmly and ask one easy question about the current goal. "
             "Do not name it as a lesson."
