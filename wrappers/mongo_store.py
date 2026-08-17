@@ -1,235 +1,690 @@
-"""MongoDB wrapper — sessions, topics seed, transcripts + Cloudinary URLs."""
+"""MongoDB — owned collections + indexes. Never touches `users`."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
-
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.collection import Collection
+from pymongo.database import Database
+from pymongo.errors import (
+    BulkWriteError,
+    CollectionInvalid,
+    DuplicateKeyError,
+    OperationFailure,
+)
 
-from core.topics import load_topics
+from core import call_log
+from core.db import schema as S
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _oid_or_str(value: str) -> dict | str:
+    """Match a hex id stored as either ObjectId or string."""
+    from bson import ObjectId
+
+    text = str(value or "").strip()
+    if ObjectId.is_valid(text):
+        return {"$in": [text, ObjectId(text)]}
+    return text
+
+
+def _without_none(doc: dict) -> dict:
+    return {key: value for key, value in doc.items() if value is not None}
+
+
+def atlas_profile_fields(fields: dict, conversation_id: str) -> dict:
+    """Atlas user_profile_memory requires root key + value (collMod is skipped)."""
+    payload = _without_none(dict(fields))
+    cid = str(conversation_id or "").strip()
+    payload["key"] = "profile"
+    payload["value"] = {
+        "profile": payload.get("profile") or {},
+        "facts": payload.get("facts") or [],
+    }
+    if cid:
+        payload["sourceConversationId"] = cid
+    return payload
+
+
+def atlas_learning_fields(fields: dict, conversation_id: str) -> dict:
+    """Atlas learning_memory requires root type + string value (collMod is skipped)."""
+    payload = _without_none(dict(fields))
+    cid = str(conversation_id or "").strip()
+    payload["type"] = "learning"
+    assessment = payload.get("overallAssessment") or {}
+    level = ""
+    if isinstance(assessment, dict):
+        level = str(assessment.get("level") or "").strip()
+    payload["value"] = level or "aggregated"
+    if cid:
+        payload["sourceConversationId"] = cid
+    updated = payload.get("updatedAt")
+    if updated is not None:
+        payload["lastObservedAt"] = updated
+    return payload
 
 
 class MongoStore:
-    def __init__(self, uri: str, db_name: str = "ai_talk") -> None:
-        # Fail fast if Atlas is slow — don't freeze page reloads / startup
+    def __init__(
+        self,
+        uri: str,
+        db_name: str = "ai_talk",
+        *,
+        users_db: str = "",
+    ) -> None:
         self._client = MongoClient(
             uri,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=8000,
+            socketTimeoutMS=15000,
         )
-        self._db = self._client[db_name]
-        self.sessions: Collection = self._db["sessions"]
-        self.topics: Collection = self._db["topics"]
-        self.meta: Collection = self._db["meta"]
-        self.learner_profiles: Collection = self._db["learner_profiles"]
-        self.learner_vectors: Collection = self._db["learner_vectors"]
-        try:
-            self.sessions.create_index("session_id", unique=True)
-            self.topics.create_index("id", unique=True)
-        except Exception:
-            # Index creation can wait; don't block app boot
-            pass
+        self._db: Database = self._client[db_name]
+        users_name = (users_db or "").strip() or db_name
+        self.users: Collection = self._client[users_name][S.USERS]
+        self.topics: Collection = self._db[S.TOPICS]
+        self.topic_progress: Collection = self._db[S.TOPIC_PROGRESS]
+        self.conversation_sessions: Collection = self._db[S.CONVERSATION_SESSIONS]
+        self.messages: Collection = self._db[S.MESSAGES]
+        self.conversation_summaries: Collection = self._db[S.CONVERSATION_SUMMARIES]
+        self.user_profile_memory: Collection = self._db[S.USER_PROFILE_MEMORY]
+        self.learning_memory: Collection = self._db[S.LEARNING_MEMORY]
+        self.memory_metadata: Collection = self._db[S.MEMORY_METADATA]
 
-    def ensure_memory_indexes(self) -> None:
-        try:
-            self.learner_profiles.create_index("learner_id", unique=True)
-            self.learner_vectors.create_index("learner_id")
-            self.learner_vectors.create_index(
-                [("learner_id", 1), ("doc_id", 1)], unique=True
-            )
-        except Exception:
-            pass
+    def ping(self) -> None:
+        self._client.admin.command("ping")
 
-    def seed_topics(self, *, force: bool = False) -> int:
-        """Seed topics once. Skip if already done (unless force=True)."""
-        flag = self.meta.find_one({"_id": "topics_seed"})
-        if flag and not force:
-            return 0
-        if not force and self.topics.estimated_document_count() > 0:
-            self.meta.update_one(
-                {"_id": "topics_seed"},
-                {"$set": {"done": True, "at": _utc_now()}},
-                upsert=True,
-            )
-            return 0
+    def ensure_schema(self) -> None:
+        """Create collections (except users) + indexes. Idempotent."""
+        existing = set(self._db.list_collection_names())
+        if S.USERS in existing:
+            call_log.info("MONGO", f"users collection present — left untouched")
+        for name in S.OWNED_COLLECTIONS:
+            validator = S.COLLECTION_VALIDATORS[name]
+            if name not in existing:
+                try:
+                    self._db.create_collection(name, validator=validator)
+                    call_log.info("MONGO", f"created collection={name}")
+                except CollectionInvalid:
+                    pass
+            else:
+                try:
+                    self._db.command(
+                        {
+                            "collMod": name,
+                            "validator": validator,
+                            "validationLevel": "moderate",
+                        }
+                    )
+                except OperationFailure as exc:
+                    call_log.warn("MONGO", f"validator skip {name}: {exc}")
+        self._drop_legacy_profile_key_index()
+        self._drop_legacy_learning_indexes()
+        for coll_name, keys, unique in S.INDEXES:
+            try:
+                self._db[coll_name].create_index(keys, unique=unique)
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn("MONGO", f"index skip {coll_name} {keys}: {exc}")
+        print(
+            "[api] mongo schema ready: "
+            + ", ".join(S.OWNED_COLLECTIONS)
+            + " (users ignored)"
+        )
 
-        count = 0
-        for topic in load_topics():
-            self.topics.update_one(
-                {"id": topic.id},
+    def seed_global_topics(self) -> dict[str, int]:
+        """Upsert 25 global topics by slug. Never writes userId. Idempotent."""
+        from core.db.topics_seed import TOPICS, utc_now
+
+        slugs = [t["slug"] for t in TOPICS]
+        self.topics.delete_many(
+            {"$or": [{"slug": {"$exists": False}}, {"slug": {"$nin": slugs}}]}
+        )
+        now = utc_now()
+        inserted = 0
+        updated = 0
+        for topic in TOPICS:
+            payload = {k: v for k, v in topic.items()}
+            result = self.topics.update_one(
+                {"slug": topic["slug"]},
                 {
-                    "$set": {
-                        **topic.as_dict(),
-                        "updated_at": _utc_now(),
-                    },
-                    "$setOnInsert": {"created_at": _utc_now()},
+                    "$set": {**payload, "updatedAt": now},
+                    "$setOnInsert": {"createdAt": now},
+                    "$unset": {"userId": ""},
                 },
                 upsert=True,
             )
-            count += 1
-
-        self.meta.update_one(
-            {"_id": "topics_seed"},
-            {"$set": {"done": True, "count": count, "at": _utc_now()}},
-            upsert=True,
-        )
-        return count
-
-    def list_topics(self) -> list[dict[str, Any]]:
-        rows = list(self.topics.find({}, {"_id": 0}).sort("title", 1))
-        return rows or [t.as_dict() for t in load_topics()]
-
-    def create_session(
-        self,
-        session_id: str,
-        mode: str,
-        *,
-        topic_id: str | None = None,
-        topic_title: str | None = None,
-    ) -> None:
-        now = _utc_now()
-        doc: dict[str, Any] = {
-            "session_id": session_id,
-            "mode": mode,
-            "topic_id": topic_id,
-            "topic_title": topic_title,
-            "keywords": [],
-            "messages": [],
-            "audios": [],
-            "created_at": now,
-            "updated_at": now,
+            if result.upserted_id is not None:
+                inserted += 1
+            elif result.modified_count:
+                updated += 1
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "unchanged": len(TOPICS) - inserted - updated,
+            "total": self.topics.count_documents({"slug": {"$in": slugs}}),
         }
-        self.sessions.insert_one(doc)
 
-    def set_keywords(self, session_id: str, keywords: list[str]) -> None:
-        self.sessions.update_one(
-            {"session_id": session_id},
-            {"$set": {"keywords": keywords, "updated_at": _utc_now()}},
+    def _drop_legacy_profile_key_index(self) -> None:
+        """One profile doc per user — drop the old unique (userId, key) index."""
+        try:
+            self.user_profile_memory.drop_index("userId_1_key_1")
+            call_log.info("MONGO", "dropped legacy user_profile_memory userId_1_key_1")
+        except Exception:
+            pass
+
+    def _drop_legacy_learning_indexes(self) -> None:
+        """One learning-memory doc per user — drop per-type indexes."""
+        for name in ("userId_1_type_1", "userId_1_topicId_1", "lastObservedAt_-1"):
+            try:
+                self.learning_memory.drop_index(name)
+                call_log.info("MONGO", f"dropped legacy learning_memory {name}")
+            except Exception:
+                pass
+
+    def find_user(self, user_id: str) -> dict | None:
+        """Read-only lookup. Never creates or writes `users`."""
+        from bson import ObjectId
+
+        uid = (user_id or "").strip()
+        if not uid:
+            return None
+        queries: list[dict] = [{"_id": uid}, {"userId": uid}]
+        if ObjectId.is_valid(uid):
+            queries.insert(0, {"_id": ObjectId(uid)})
+        for query in queries:
+            doc = self.users.find_one(query)
+            if doc:
+                return doc
+        return None
+
+    def find_in_progress(self, user_id: str) -> dict | None:
+        return self.topic_progress.find_one(
+            {"userId": user_id, "status": "IN_PROGRESS"}
         )
 
-    def add_message(
-        self,
-        session_id: str,
-        role: str,
-        content: str,
-        *,
-        turn: int,
-        audio_url: str | None = None,
-    ) -> None:
-        msg: dict[str, Any] = {
-            "role": role,
-            "content": content,
-            "turn": turn,
-            "at": _utc_now(),
-        }
-        if audio_url:
-            msg["audio_url"] = audio_url
-        self.sessions.update_one(
-            {"session_id": session_id},
-            {
-                "$push": {"messages": msg},
-                "$set": {"updated_at": _utc_now()},
-            },
+    def list_progress(self, user_id: str) -> list[dict]:
+        return list(self.topic_progress.find({"userId": user_id}))
+
+    def list_active_topics(self, level: str) -> list[dict]:
+        return list(
+            self.topics.find(
+                {"level": level, "isActive": True},
+            ).sort("order", 1)
         )
 
-    def add_audio(
-        self,
-        session_id: str,
-        *,
-        turn: int,
-        role: str,
-        url: str,
-        public_id: str,
-    ) -> None:
-        self.sessions.update_one(
-            {"session_id": session_id},
-            {
-                "$push": {
-                    "audios": {
-                        "turn": turn,
-                        "role": role,
-                        "url": url,
-                        "public_id": public_id,
-                        "at": _utc_now(),
-                    }
-                },
-                "$set": {"updated_at": _utc_now()},
-            },
-        )
+    def list_curriculum_topics(self, level: str | None = None) -> list[dict]:
+        query: dict = {"isActive": {"$ne": False}}
+        if level:
+            query["level"] = str(level).strip().upper()
+        return list(self.topics.find(query).sort([("level", 1), ("order", 1)]))
 
-    def get_session(self, session_id: str) -> dict[str, Any] | None:
-        return self.sessions.find_one({"session_id": session_id}, {"_id": 0})
+    def find_topic(self, topic_id) -> dict | None:
+        from bson import ObjectId
 
-    def get_learner_profile(self, learner_id: str) -> dict[str, Any] | None:
-        return self.learner_profiles.find_one({"learner_id": learner_id}, {"_id": 0})
+        if topic_id is None:
+            return None
+        doc = self.topics.find_one({"_id": topic_id})
+        if doc:
+            return doc
+        text = str(topic_id)
+        if ObjectId.is_valid(text):
+            return self.topics.find_one({"_id": ObjectId(text)})
+        return self.topics.find_one({"slug": text})
 
-    def upsert_learner_profile(self, learner_id: str, facts: dict[str, str]) -> None:
-        if not learner_id or not facts:
+    def upsert_progress(self, docs: list[dict]) -> None:
+        if not docs:
             return
-        self.learner_profiles.update_one(
-            {"learner_id": learner_id},
-            {
-                "$set": {"facts": facts, "updated_at": _utc_now()},
-                "$setOnInsert": {"learner_id": learner_id, "created_at": _utc_now()},
-            },
-            upsert=True,
+        ops = []
+        for doc in docs:
+            payload = {key: value for key, value in doc.items() if value is not None}
+            ops.append(
+                UpdateOne(
+                    {"userId": payload["userId"], "topicId": payload["topicId"]},
+                    {"$setOnInsert": payload},
+                    upsert=True,
+                )
+            )
+        try:
+            self.topic_progress.bulk_write(ops, ordered=False)
+        except BulkWriteError as exc:
+            call_log.error("MONGO", f"upsert_progress failed: {exc.details}")
+            raise
+
+    def mark_in_progress(self, user_id: str, topic_id) -> dict | None:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        return self.topic_progress.find_one_and_update(
+            {"userId": user_id, "topicId": topic_id, "status": "NOT_STARTED"},
+            {"$set": {"status": "IN_PROGRESS", "startedAt": now, "updatedAt": now}},
+            return_document=ReturnDocument.AFTER,
         )
 
-    def upsert_learner_vector(
+    def reopen_for_revisit(self, user_id: str, topic_id) -> dict | None:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        uid = str(user_id or "").strip()
+        if not uid or topic_id is None:
+            return None
+        return self.topic_progress.find_one_and_update(
+            {
+                "userId": uid,
+                "topicId": topic_id,
+                "status": "COMPLETED",
+                "needsRevisit": True,
+            },
+            {
+                "$set": {"status": "IN_PROGRESS", "updatedAt": now},
+                "$inc": {"attemptCount": 1},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def update_progress_fields(self, user_id: str, topic_id, fields: dict) -> dict | None:
+        from bson import ObjectId
+        from datetime import datetime, timezone
+
+        uid = str(user_id or "").strip()
+        if not uid or topic_id is None or not fields:
+            return None
+        payload = dict(fields)
+        payload["updatedAt"] = payload.get("updatedAt") or datetime.now(timezone.utc)
+        topic_ids = [topic_id]
+        text = str(topic_id)
+        if ObjectId.is_valid(text):
+            oid = ObjectId(text)
+            if oid not in topic_ids:
+                topic_ids.append(oid)
+        return self.topic_progress.find_one_and_update(
+            {"userId": uid, "topicId": {"$in": topic_ids}},
+            {"$set": payload},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def find_progress(self, user_id: str, topic_id) -> dict | None:
+        from bson import ObjectId
+
+        uid = str(user_id or "").strip()
+        if not uid or topic_id is None:
+            return None
+        doc = self.topic_progress.find_one({"userId": uid, "topicId": topic_id})
+        if doc:
+            return doc
+        text = str(topic_id)
+        if ObjectId.is_valid(text):
+            return self.topic_progress.find_one(
+                {"userId": uid, "topicId": ObjectId(text)}
+            )
+        return None
+
+    def apply_progress_from_conversation(
         self,
-        *,
-        learner_id: str,
-        doc_id: str,
-        text: str,
-        kind: str,
-        vector: list[float],
-        extra: dict[str, Any],
-    ) -> None:
-        self.learner_vectors.update_one(
-            {"learner_id": learner_id, "doc_id": doc_id},
+        user_id: str,
+        topic_id,
+        conversation_id: str,
+        fields: dict,
+    ) -> dict | None:
+        from bson import ObjectId
+
+        uid = str(user_id or "").strip()
+        cid = str(conversation_id or "").strip()
+        if not uid or topic_id is None or not cid:
+            return None
+        topic_ids: list = [topic_id]
+        conv_ids: list = [cid]
+        text = str(topic_id)
+        if ObjectId.is_valid(text):
+            oid = ObjectId(text)
+            if oid not in topic_ids:
+                topic_ids.append(oid)
+        if ObjectId.is_valid(cid):
+            conv_ids.append(ObjectId(cid))
+        filt = {
+            "userId": uid,
+            "topicId": {"$in": topic_ids},
+            "processedConversationIds": {"$nin": conv_ids},
+        }
+        payload = dict(fields)
+        return self.topic_progress.find_one_and_update(
+            filt,
             {
-                "$set": {
-                    "text": text,
-                    "kind": kind,
-                    "vector": vector,
-                    "extra": extra,
-                    "updated_at": _utc_now(),
+                "$set": payload,
+                "$inc": {"attemptCount": 1},
+                "$addToSet": {"processedConversationIds": cid},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def insert_conversation_session(self, doc: dict) -> dict:
+        payload = dict(doc)
+        result = self.conversation_sessions.insert_one(payload)
+        payload["_id"] = result.inserted_id
+        return payload
+
+    def find_conversation_session(self, conversation_id: str) -> dict | None:
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        if not cid:
+            return None
+        if ObjectId.is_valid(cid):
+            doc = self.conversation_sessions.find_one({"_id": ObjectId(cid)})
+            if doc:
+                return doc
+        return self.conversation_sessions.find_one({"_id": cid})
+
+    def close_conversation_session(
+        self,
+        conversation_id: str,
+        *,
+        status: str,
+        ended_at,
+        duration_seconds: int,
+        end_reason: str | None = None,
+    ) -> dict | None:
+        from datetime import datetime, timezone
+
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        if not cid:
+            return None
+        filt: dict = {"status": "ACTIVE"}
+        if ObjectId.is_valid(cid):
+            filt["_id"] = ObjectId(cid)
+        else:
+            filt["_id"] = cid
+        now = datetime.now(timezone.utc)
+        fields: dict = {
+            "status": status,
+            "endedAt": ended_at,
+            "durationSeconds": duration_seconds,
+            "duration": duration_seconds,
+            "updatedAt": now,
+        }
+        if end_reason:
+            fields["endReason"] = end_reason
+        return self.conversation_sessions.find_one_and_update(
+            filt,
+            {"$set": fields},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def claim_next_message_sequence(
+        self, conversation_id: str, *, user_id: str | None = None
+    ) -> dict | None:
+        from datetime import datetime, timezone
+
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        if not cid:
+            return None
+        filt: dict = {"status": "ACTIVE"}
+        if ObjectId.is_valid(cid):
+            filt["_id"] = ObjectId(cid)
+        else:
+            filt["_id"] = cid
+        uid = str(user_id or "").strip()
+        if uid:
+            filt["userId"] = _oid_or_str(uid)
+        now = datetime.now(timezone.utc)
+        return self.conversation_sessions.find_one_and_update(
+            filt,
+            {
+                "$inc": {"messageCount": 1},
+                "$set": {"lastMessageAt": now, "updatedAt": now},
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def insert_message(self, doc: dict) -> dict:
+        payload = dict(doc)
+        result = self.messages.insert_one(payload)
+        payload["_id"] = result.inserted_id
+        return payload
+
+    def list_messages(self, conversation_id: str) -> list[dict]:
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        if not cid:
+            return []
+        ids: list = [cid]
+        if ObjectId.is_valid(cid):
+            ids.append(ObjectId(cid))
+        return list(
+            self.messages.find({"conversationId": {"$in": ids}}).sort("sequence", 1)
+        )
+
+    def find_conversation_summary(self, conversation_id: str) -> dict | None:
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        if not cid:
+            return None
+        ids: list = [cid]
+        if ObjectId.is_valid(cid):
+            ids.append(ObjectId(cid))
+        return self.conversation_summaries.find_one({"conversationId": {"$in": ids}})
+
+    def upsert_conversation_summary(self, conversation_id: str, doc: dict) -> dict:
+        from datetime import datetime, timezone
+
+        from bson import ObjectId
+
+        cid = str(conversation_id or "").strip()
+        payload = dict(doc)
+        now = datetime.now(timezone.utc)
+        payload["updatedAt"] = payload.get("updatedAt") or now
+        filt: dict
+        if ObjectId.is_valid(cid):
+            filt = {"conversationId": {"$in": [cid, ObjectId(cid)]}}
+        else:
+            filt = {"conversationId": cid}
+        self.conversation_summaries.update_one(
+            filt,
+            {"$set": payload, "$setOnInsert": {"createdAt": payload.get("createdAt") or now}},
+            upsert=True,
+        )
+        saved = self.find_conversation_summary(cid)
+        if saved is None:
+            payload.setdefault("createdAt", now)
+            return payload
+        return saved
+
+    def find_user_profile(self, user_id: str) -> dict | None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        return self.user_profile_memory.find_one({"userId": uid})
+
+    def apply_profile_from_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        fields: dict,
+    ) -> dict | None:
+        """Atomic upsert of one profile doc per user. No-op if conversation already processed."""
+        from datetime import datetime, timezone
+
+        from bson import ObjectId
+
+        uid = str(user_id or "").strip()
+        cid = str(conversation_id or "").strip()
+        if not uid or not cid:
+            return None
+        conv_ids: list = [cid]
+        if ObjectId.is_valid(cid):
+            conv_ids.append(ObjectId(cid))
+        now = datetime.now(timezone.utc)
+        payload = atlas_profile_fields(fields, cid)
+        payload.pop("createdAt", None)
+        payload.pop("version", None)
+        payload.pop("userId", None)
+        payload.pop("processedConversationIds", None)
+        filt = {
+            "userId": uid,
+            "processedConversationIds": {"$nin": conv_ids},
+        }
+        update = {
+            "$set": payload,
+            "$inc": {"version": 1},
+            "$addToSet": {"processedConversationIds": cid},
+            "$setOnInsert": {"userId": uid, "createdAt": now},
+        }
+
+        def _apply(*, upsert: bool) -> dict | None:
+            return self.user_profile_memory.find_one_and_update(
+                filt,
+                update if upsert else {
+                    "$set": payload,
+                    "$inc": {"version": 1},
+                    "$addToSet": {"processedConversationIds": cid},
                 },
-                "$setOnInsert": {"created_at": _utc_now()},
+                upsert=upsert,
+                return_document=ReturnDocument.AFTER,
+            )
+
+        try:
+            return _apply(upsert=True)
+        except DuplicateKeyError:
+            return _apply(upsert=False)
+        except OperationFailure as exc:
+            call_log.error("MONGO", f"profile upsert failed: {exc.details or exc}")
+            raise
+
+    def find_learning_memory(self, user_id: str) -> dict | None:
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        return self.learning_memory.find_one({"userId": uid})
+
+    def apply_learning_memory_from_conversation(
+        self,
+        user_id: str,
+        conversation_id: str,
+        fields: dict,
+    ) -> dict | None:
+        """Atomic upsert of one learning-memory doc per user. No-op if already processed."""
+        from datetime import datetime, timezone
+
+        from bson import ObjectId
+
+        uid = str(user_id or "").strip()
+        cid = str(conversation_id or "").strip()
+        if not uid or not cid:
+            return None
+        conv_ids: list = [cid]
+        if ObjectId.is_valid(cid):
+            conv_ids.append(ObjectId(cid))
+        now = datetime.now(timezone.utc)
+        payload = atlas_learning_fields(fields, cid)
+        payload.pop("createdAt", None)
+        payload.pop("version", None)
+        payload.pop("userId", None)
+        payload.pop("processedConversationIds", None)
+        filt = {
+            "userId": uid,
+            "processedConversationIds": {"$nin": conv_ids},
+        }
+        update = {
+            "$set": payload,
+            "$inc": {"version": 1},
+            "$addToSet": {"processedConversationIds": cid},
+            "$setOnInsert": {"userId": uid, "createdAt": now},
+        }
+
+        def _apply(*, upsert: bool) -> dict | None:
+            return self.learning_memory.find_one_and_update(
+                filt,
+                update if upsert else {
+                    "$set": payload,
+                    "$inc": {"version": 1},
+                    "$addToSet": {"processedConversationIds": cid},
+                },
+                upsert=upsert,
+                return_document=ReturnDocument.AFTER,
+            )
+
+        try:
+            return _apply(upsert=True)
+        except DuplicateKeyError:
+            return _apply(upsert=False)
+        except OperationFailure as exc:
+            call_log.error("MONGO", f"learning upsert failed: {exc.details or exc}")
+            raise
+
+    def find_memory_metadata(self, memory_id: str) -> dict | None:
+        mid = str(memory_id or "").strip()
+        if not mid:
+            return None
+        return self.memory_metadata.find_one({"memoryId": mid})
+
+    def find_memory_by_identity(
+        self, *, tenant_id: str, user_id: str, identity_key: str
+    ) -> dict | None:
+        return self.memory_metadata.find_one(
+            {
+                "tenantId": str(tenant_id or "").strip(),
+                "userId": str(user_id or "").strip(),
+                "identityKey": str(identity_key or "").strip(),
+            }
+        )
+
+    def list_memory_metadata(
+        self, *, tenant_id: str, user_id: str, indexed_only: bool | None = None
+    ) -> list[dict]:
+        filt: dict = {
+            "tenantId": str(tenant_id or "").strip(),
+            "userId": str(user_id or "").strip(),
+        }
+        if indexed_only is True:
+            filt["indexed"] = True
+        elif indexed_only is False:
+            filt["indexed"] = {"$ne": True}
+        return list(self.memory_metadata.find(filt))
+
+    def list_memory_metadata_for_tenant(self, tenant_id: str) -> list[dict]:
+        return list(
+            self.memory_metadata.find({"tenantId": str(tenant_id or "").strip()})
+        )
+
+    def upsert_memory_metadata(self, doc: dict) -> dict:
+        from datetime import datetime, timezone
+
+        payload = dict(doc)
+        now = datetime.now(timezone.utc)
+        payload["updatedAt"] = payload.get("updatedAt") or now
+        created_at = payload.pop("createdAt", None) or now
+        memory_id = str(payload.get("memoryId") or "").strip()
+        identity = str(payload.get("identityKey") or "").strip()
+        if memory_id:
+            filt = {"memoryId": memory_id}
+        else:
+            filt = {
+                "tenantId": payload.get("tenantId"),
+                "userId": payload.get("userId"),
+                "identityKey": identity,
+            }
+        self.memory_metadata.update_one(
+            filt,
+            {
+                "$set": payload,
+                "$setOnInsert": {"createdAt": created_at},
             },
             upsert=True,
         )
+        return self.memory_metadata.find_one(filt) or payload
 
-    def query_learner_vectors(
-        self, learner_id: str, query_vec: list[float], top_k: int = 5
-    ) -> list[str]:
-        """Per-user cosine — O(this learner's docs), not O(all users)."""
-        import numpy as np
+    def delete_memory_metadata(self, memory_id: str) -> None:
+        mid = str(memory_id or "").strip()
+        if not mid:
+            return
+        self.memory_metadata.delete_one({"memoryId": mid})
 
-        rows = list(
-            self.learner_vectors.find(
-                {"learner_id": learner_id},
-                {"_id": 0, "text": 1, "vector": 1},
-            ).limit(80)
+    def delete_user_memory_metadata(self, *, tenant_id: str, user_id: str) -> None:
+        self.memory_metadata.delete_many(
+            {
+                "tenantId": str(tenant_id or "").strip(),
+                "userId": str(user_id or "").strip(),
+            }
         )
-        if not rows:
-            return []
-        q = np.array(query_vec, dtype=float)
-        scored: list[tuple[float, str]] = []
-        qn = float(np.linalg.norm(q)) or 1e-9
-        for row in rows:
-            vec = row.get("vector") or []
-            if not vec:
-                continue
-            v = np.array(vec, dtype=float)
-            denom = qn * (float(np.linalg.norm(v)) or 1e-9)
-            scored.append((float(np.dot(q, v) / denom), str(row.get("text") or "")))
-        scored.sort(reverse=True)
-        return [t for _, t in scored[:top_k] if t]

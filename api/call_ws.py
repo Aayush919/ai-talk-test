@@ -19,17 +19,59 @@ from starlette.websockets import WebSocketState
 
 from core.coach_service import (
     CoachService,
+    DraftReply,
     needs_fresh_reply,
     transcripts_compatible,
 )
 from core import call_log
 from core.config import Settings
 from core.session import Session
-from core.text_clean import safe_print
+from core.text_clean import clip_spoken_reply, safe_print
+from core.conversations.message_service import ConversationMessageService
+from core.conversations.session_service import (
+    CALL_TYPE_AI_COACH,
+    ConversationSessionService,
+    REASON_NETWORK_FAILURE,
+    REASON_TIMEOUT,
+    REASON_USER_ENDED_CALL,
+    topic_id_of,
+)
+from core.topics.view import public_practice_plan
+from core.conversations.summary_service import (
+    ConversationSummaryService,
+    run_summary_job,
+)
+from core.runtime.graph import FALLBACK_RESPONSE
+from core.topics.errors import TopicProgressError
+from core.topics.progress_service import TopicProgressService
 from wrappers.deepgram_tts import split_speak_chunks
+
+OPENING_FALLBACK = (
+    "Hi. I'm your English speaking coach. Tell me a little about yourself."
+)
 
 # local import of _norm via needs / compatible already enough
 from core.coach_service import _norm
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    try:
+        from bson import ObjectId
+
+        if isinstance(value, ObjectId):
+            return str(value)
+    except Exception:
+        pass
+    return value
 
 print = safe_print  # Windows cp1252-safe (no charmap crash on fancy dashes)
 
@@ -71,6 +113,18 @@ def _transcript_from_results(message: ListenV1Results) -> str:
     return (getattr(alts[0], "transcript", None) or "").strip()
 
 
+def _confidence_from_results(message: ListenV1Results) -> float | None:
+    channel = message.channel
+    alts = getattr(channel, "alternatives", None) or []
+    if not alts:
+        return None
+    value = getattr(alts[0], "confidence", None)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _peak_16le(chunk: bytes, bridge: Any) -> None:
     """Cheap loudness probe — tells a muted mic apart from a missing mic."""
     if bridge._audio_bytes > 400_000:  # ~12s of audio is plenty to judge
@@ -110,11 +164,29 @@ class LiveCallBridge:
         session: Session,
         coach: CoachService,
         settings: Settings,
+        topic_progress: TopicProgressService | None = None,
+        conversation_sessions: ConversationSessionService | None = None,
+        conversation_messages: ConversationMessageService | None = None,
+        conversation_summaries: ConversationSummaryService | None = None,
+        profile_memory=None,
+        learning_memory=None,
+        conversation_runtime=None,
+        semantic_memory=None,
     ) -> None:
         self.ws = websocket
         self.session = session
         self.coach = coach
         self.settings = settings
+        self.topic_progress = topic_progress
+        self.conversation_sessions = conversation_sessions
+        self.conversation_messages = conversation_messages
+        self.conversation_summaries = conversation_summaries
+        self.profile_memory = profile_memory
+        self.learning_memory = learning_memory
+        self.conversation_runtime = conversation_runtime
+        self.semantic_memory = semantic_memory
+        self._last_target_goal_id: str | None = None
+        self._last_stt_confidence: float | None = None
         self._audio_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=128)
         self._pending = ""
         self._queued = ""
@@ -145,6 +217,10 @@ class LiveCallBridge:
         self._audio_bytes = 0
         self._audio_peak = 0
         self._mic_flagged = False
+        self._hangup_ok = False
+        self._end_reason = REASON_NETWORK_FAILURE
+        self._persist_tasks: set[asyncio.Task[Any]] = set()
+        self._persist_chain: asyncio.Task[Any] | None = None
 
     def _sid(self) -> str:
         return getattr(self.session, "session_id", "") or ""
@@ -169,10 +245,12 @@ class LiveCallBridge:
             extra={
                 "mode": latency.get("mode"),
                 "llm_ms": latency.get("llm_ms"),
+                "llm_ttfb_ms": latency.get("llm_ttfb_ms", latency.get("llm_ms")),
                 "ttfb_ms": latency.get("ttfb_ms"),
                 "tts_ms": latency.get("tts_ms"),
                 "flush_ms": latency.get("flush_ms"),
                 "spec": latency.get("speculative"),
+                "total_turn_ms": latency.get("total_ms") or latency.get("wait_ms"),
             },
         )
 
@@ -335,6 +413,8 @@ class LiveCallBridge:
                 self._speaking = False
 
     async def _end_for_silence(self) -> None:
+        self._hangup_ok = True
+        self._end_reason = REASON_TIMEOUT
         await self._speak_line("No answer, so I'm ending the call. Talk to you soon!")
         await asyncio.sleep(max(0.0, self._speak_until - time.perf_counter()))
         call_log.info(
@@ -363,15 +443,396 @@ class LiveCallBridge:
         except Exception:
             pass
 
+    async def _init_current_topic(self) -> dict[str, Any] | None:
+        """After the live socket is up — never on register / session create."""
+        if self.topic_progress is None:
+            return None
+        user_id = (self.session.learner_id or "").strip()
+        if not user_id:
+            await self.send_json(
+                {"type": "error", "code": "USER_NOT_FOUND", "detail": "USER_NOT_FOUND"}
+            )
+            return None
+        try:
+            result = await asyncio.to_thread(
+                getattr(
+                    self.topic_progress,
+                    "getPracticePlan",
+                    self.topic_progress.getOrInitializeCurrentTopic,
+                ),
+                user_id,
+            )
+            self.session.current_topic = result
+            call_log.info(
+                "TOPIC",
+                "current topic ready",
+                session_id=self._sid(),
+                extra={
+                    "initialized": result.get("initialized"),
+                    "slug": (result.get("topic") or {}).get("slug"),
+                },
+            )
+            return _json_safe(result)
+        except TopicProgressError as exc:
+            call_log.warn("TOPIC", exc.code, session_id=self._sid())
+            await self.send_json(
+                {"type": "error", "code": exc.code, "detail": exc.code}
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            call_log.warn("TOPIC", f"init skip: {exc}", session_id=self._sid())
+            await self.send_json(
+                {
+                    "type": "error",
+                    "code": "TOPIC_PROGRESS_INTERNAL_ERROR",
+                    "detail": "TOPIC_PROGRESS_INTERNAL_ERROR",
+                }
+            )
+            return None
+
+    async def _create_conversation_session(self) -> dict[str, Any] | None:
+        """After a successful socket + current topic — never on register / invite."""
+        svc = self.conversation_sessions
+        if svc is None:
+            return None
+        user_id = (self.session.learner_id or "").strip()
+        topic_id = topic_id_of(self.session.current_topic)
+        if not user_id or topic_id is None:
+            return None
+        try:
+            result = await asyncio.to_thread(
+                lambda: svc.createConversationSession(
+                    userId=user_id,
+                    topicId=topic_id,
+                    callType=CALL_TYPE_AI_COACH,
+                )
+            )
+            self.session.conversation_id = result["conversationId"]
+            if self.conversation_runtime is not None:
+                try:
+                    await asyncio.to_thread(
+                        self.conversation_runtime.initializeConversationRuntime,
+                        result["conversationId"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    call_log.warn(
+                        "RUNTIME",
+                        f"init skip: {exc}",
+                        session_id=self._sid(),
+                    )
+            call_log.info(
+                "SESSION",
+                "conversation session active",
+                session_id=self._sid(),
+                extra={"conversationId": result["conversationId"]},
+            )
+            return _json_safe(result)
+        except TopicProgressError as exc:
+            call_log.warn("SESSION", exc.code, session_id=self._sid())
+            await self.send_json(
+                {"type": "error", "code": exc.code, "detail": exc.code}
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            call_log.warn("SESSION", f"create skip: {exc}", session_id=self._sid())
+            await self.send_json(
+                {
+                    "type": "error",
+                    "code": "TOPIC_PROGRESS_INTERNAL_ERROR",
+                    "detail": "TOPIC_PROGRESS_INTERNAL_ERROR",
+                }
+            )
+            return None
+
+    def _draft_reply(self, text: str) -> DraftReply:
+        t0 = time.perf_counter()
+        cid = self.session.conversation_id
+        runtime = self.conversation_runtime
+        if runtime is not None and cid:
+            try:
+                decision = runtime.previewResponse(
+                    cid, text, sttConfidence=self._last_stt_confidence
+                )
+                self._last_target_goal_id = decision.get("targetGoalId")
+                reply = clip_spoken_reply(
+                    str(decision.get("response") or decision.get("text") or "").strip(),
+                    user_text=text,
+                )
+                llm_ms = int(decision.get("llm_ms") or 0)
+                if llm_ms <= 0:
+                    llm_ms = int((time.perf_counter() - t0) * 1000)
+                if reply:
+                    history_texts = [m["content"] for m in self.session.messages]
+                    keywords = self.coach.tfidf.extract(history_texts, text)
+                    return DraftReply(
+                        user_text=text,
+                        coach_text=reply,
+                        keywords=keywords,
+                        llm_ms=llm_ms,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn(
+                    "RUNTIME",
+                    f"preview skip: {type(exc).__name__}: {exc}",
+                    session_id=self._sid(),
+                    extra={"latency_ms": int((time.perf_counter() - t0) * 1000)},
+                )
+            return DraftReply(
+                user_text=text,
+                coach_text=FALLBACK_RESPONSE,
+                keywords=[],
+                llm_ms=int((time.perf_counter() - t0) * 1000),
+            )
+        draft = self.coach.draft_reply(self.session, text)
+        if draft.llm_ms <= 0:
+            draft.llm_ms = int((time.perf_counter() - t0) * 1000)
+        return draft
+
+    def _commit_turn(
+        self,
+        *,
+        user_text: str,
+        coach_text: str,
+        keywords: list[str],
+    ) -> int:
+        turn = self.coach.commit_text(
+            self.session,
+            user_text=user_text,
+            coach_text=coach_text,
+            keywords=keywords,
+        )
+        cid = self.session.conversation_id
+        runtime = self.conversation_runtime
+        if runtime is not None and cid:
+            try:
+                runtime.applyCommittedTurn(
+                    cid,
+                    userText=user_text,
+                    assistantText=coach_text,
+                    targetGoalId=self._last_target_goal_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn("RUNTIME", f"commit skip: {exc}", session_id=self._sid())
+        return turn
+
+    async def _finalize_conversation_session(self) -> None:
+        """Single backend cleanup: normal hangup → COMPLETED, anything else → FAILED."""
+        cid = self.session.conversation_id
+        svc = self.conversation_sessions
+        if not cid or svc is None:
+            return
+        runtime = self.conversation_runtime
+        if runtime is not None:
+            try:
+                await asyncio.to_thread(runtime.endConversationRuntime, cid)
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn("RUNTIME", f"end skip: {exc}", session_id=self._sid())
+        user_id = (self.session.learner_id or "").strip() or None
+        reason = self._end_reason
+        try:
+            if self._hangup_ok:
+                result = await asyncio.to_thread(
+                    lambda: svc.completeConversationSession(
+                        cid,
+                        {"reason": reason},
+                        userId=user_id,
+                    )
+                )
+            else:
+                result = await asyncio.to_thread(
+                    lambda: svc.failConversationSession(
+                        cid,
+                        reason,
+                        userId=user_id,
+                    )
+                )
+            call_log.info(
+                "SESSION",
+                f"conversation session {result.get('status')}",
+                session_id=self._sid(),
+                extra={
+                    "conversationId": cid,
+                    "userId": result.get("userId") or user_id,
+                    "topicId": result.get("topicId"),
+                    "status": result.get("status"),
+                    "durationSeconds": result.get("durationSeconds"),
+                    "reason": result.get("reason") or reason,
+                },
+            )
+            if result.get("status") == "COMPLETED":
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        run_summary_job,
+                        self.conversation_summaries,
+                        cid,
+                        user_id=user_id,
+                        progress_service=self.topic_progress,
+                        profile_service=self.profile_memory,
+                        learning_service=self.learning_memory,
+                        semantic_service=self.semantic_memory,
+                    ),
+                    name="conversation-summary",
+                )
+        except Exception as exc:  # noqa: BLE001
+            call_log.warn("SESSION", f"finalize skip: {exc}", session_id=self._sid())
+
+    def _persist_message(
+        self,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Queue Mongo write in call order; never block STT/LLM/TTS."""
+        cid = self.session.conversation_id
+        svc = self.conversation_messages
+        text = (content or "").strip()
+        if not cid or svc is None or not text:
+            return
+        user_id = (self.session.learner_id or "").strip() or None
+        previous = self._persist_chain
+
+        async def _job() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except Exception:
+                    pass
+            try:
+                await asyncio.to_thread(
+                    lambda: svc.createConversationMessage(
+                        conversationId=cid,
+                        role=role,
+                        content=text,
+                        metadata=metadata,
+                        userId=user_id,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                cause = getattr(exc, "__cause__", None)
+                call_log.error(
+                    "MESSAGE",
+                    f"persist failed: {type(exc).__name__}: {exc}",
+                    session_id=self._sid(),
+                    extra={
+                        "conversationId": cid,
+                        "userId": user_id,
+                        "role": role,
+                        "cause": f"{type(cause).__name__}: {cause}" if cause else "",
+                    },
+                )
+
+        task = asyncio.create_task(_job(), name="persist-message")
+        self._persist_chain = task
+        self._persist_tasks.add(task)
+        task.add_done_callback(self._persist_tasks.discard)
+
+    def _fallback_opening(self) -> str:
+        return OPENING_FALLBACK
+
+    async def _speak_opening(self) -> None:
+        """AI talks first after connect. Never wait for the user to speak."""
+        cid = self.session.conversation_id
+        runtime = self.conversation_runtime
+        text = ""
+        llm_ms = 0
+        if runtime is not None and cid:
+            try:
+                opening = await asyncio.to_thread(runtime.generateOpening, cid)
+                llm_ms = int((opening or {}).get("llm_ms") or 0)
+                text = clip_spoken_reply(str((opening or {}).get("text") or "").strip())
+                call_log.info(
+                    "LATENCY",
+                    "OPENING_LLM_COMPLETE",
+                    session_id=self._sid(),
+                    extra={"llm_ms": llm_ms, "llm_ttfb_ms": llm_ms},
+                )
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn("RUNTIME", f"opening llm skip: {exc}", session_id=self._sid())
+        else:
+            call_log.warn(
+                "RUNTIME",
+                "opening using fallback — runtime or conversation missing",
+                session_id=self._sid(),
+            )
+        if not text or text == FALLBACK_RESPONSE:
+            text = self._fallback_opening()
+            if runtime is not None and cid:
+                try:
+                    runtime.graph.app.update_state(
+                        {"configurable": {"thread_id": cid}},
+                        {
+                            "lastAssistantMessage": text,
+                            "lastAssistantQuestion": text if "?" in text else None,
+                            "conversationPhase": "WARMUP",
+                        },
+                    )
+                except Exception:
+                    pass
+        self._dbg(f"opening speak {text!r}")
+        self.session.add("assistant", text)
+        self._persist_message(
+            "assistant",
+            text,
+            {"source": "ai", "ttsProvider": "deepgram", "kind": "opening"},
+        )
+        try:
+            await self.send_json(
+                {
+                    "type": "coach_turn",
+                    "turn": 0,
+                    "user_text": "",
+                    "coach_text": text,
+                    "keywords": [],
+                    "stream": True,
+                    "audio_format": "pcm_s16le",
+                    "sample_rate": 16000,
+                    "mode": "opening",
+                }
+            )
+            self._speaking = True
+            self._speak_started_at = time.perf_counter()
+            async for chunk in self.coach.tts.stream_pcm_chunked(text):
+                if self._closed:
+                    break
+                try:
+                    await self.ws.send_bytes(chunk)
+                except Exception:
+                    break
+            await self.send_json({"type": "coach_audio_end", "mode": "opening"})
+        except Exception as exc:  # noqa: BLE001
+            call_log.warn("RUNTIME", f"opening tts skip: {exc}", session_id=self._sid())
+        finally:
+            self._hold_playback(text)
+
+    async def _drain_persist_tasks(self) -> None:
+        pending = [task for task in self._persist_tasks if not task.done()]
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=2.0)
+        for task in still:
+            task.cancel()
+
     async def run(self) -> None:
         await self.ws.accept()
-        await self.send_json(
-            {
-                "type": "call_ready",
-                "session_id": self.session.session_id,
-                "message": "Live call connected — speak anytime.",
-            }
-        )
+        topic_payload = await self._init_current_topic()
+        conversation = None
+        if topic_payload:
+            conversation = await self._create_conversation_session()
+        ready = {
+            "type": "call_ready",
+            "session_id": self.session.session_id,
+            "message": "Live call connected — speak anytime.",
+        }
+        plan = public_practice_plan(topic_payload) if topic_payload else None
+        if plan:
+            ready["topic"] = plan.get("topic")
+            ready["practicePlan"] = plan
+            ready["initialized"] = plan.get("initialized")
+        if conversation:
+            ready["conversationId"] = conversation.get("conversationId")
+            ready["conversation"] = conversation
+        await self.send_json(ready)
+        await self._speak_opening()
 
         recv_task = asyncio.create_task(self._recv_browser(), name="recv")
         dg_task = asyncio.create_task(self._deepgram_loop(), name="deepgram")
@@ -382,7 +843,6 @@ class LiveCallBridge:
             "live call connected",
             session_id=self._sid(),
             extra={
-                "topic": getattr(self.session.topic, "id", "") if self.session.topic else "",
                 "logfile": str(call_log.session_log_path(self._sid())),
             },
         )
@@ -399,6 +859,8 @@ class LiveCallBridge:
         finally:
             self._closed = True
             call_log.info("DISCONNECT", "call ended", session_id=self._sid())
+            await self._drain_persist_tasks()
+            await self._finalize_conversation_session()
             await self._audio_q.put(None)
             self._cancel_spec()
             if self._turn_task and not self._turn_task.done():
@@ -455,6 +917,8 @@ class LiveCallBridge:
                 continue
             try:
                 if payload.get("type") == "end_call":
+                    self._hangup_ok = True
+                    self._end_reason = REASON_USER_ENDED_CALL
                     break
                 if payload.get("type") == "ping":
                     await self.send_json({"type": "pong"})
@@ -692,9 +1156,7 @@ class LiveCallBridge:
         try:
             await self.send_json({"type": "prep", "text": text})
             self._dbg(f"spec llm start token={token}")
-            draft = await asyncio.to_thread(
-                self.coach.draft_reply, self.session, text
-            )
+            draft = await asyncio.to_thread(self._draft_reply, text)
             if token != self._spec_token or self._closed:
                 self._dbg(f"spec llm stale token={token} now={self._spec_token}")
                 return
@@ -934,6 +1396,9 @@ class LiveCallBridge:
             text = _transcript_from_results(message)
             if text:
                 self._touch_voice()
+                conf = _confidence_from_results(message)
+                if conf is not None:
+                    self._last_stt_confidence = conf
                 await self.send_json(
                     {
                         "type": "partial",
@@ -1019,16 +1484,14 @@ class LiveCallBridge:
     async def _run_turn(self, text: str, generation: int) -> None:
         t_end = time.perf_counter()
         await self.send_json({"type": "user_final", "text": text})
+        self._persist_message(
+            "user",
+            text,
+            {"source": "voice", "sttProvider": "deepgram"},
+        )
         await self.send_json({"type": "thinking"})
         self._dbg(f"turn thinking gen={generation}")
         try:
-            mem = getattr(self.session, "memory", None)
-            if mem:
-                mem.observe_user(text, self.session.turn + 1)
-                self._dbg(
-                    f"memory observe semantic={mem.fact_card()[:80]} "
-                    f"goal={mem.next_goal()}"
-                )
             # Clarifications must hit a fresh LLM answer (no wrong speculative story)
             snap = None
             if needs_fresh_reply(text):
@@ -1061,11 +1524,15 @@ class LiveCallBridge:
             if snap is not None and snap.pcm and snap.units_done >= 1:
                 # Pipeline HIT — at least one speak-unit fully buffered; flush now
                 wait_pre = int((time.perf_counter() - t_end) * 1000)
-                turn = self.coach.commit_text(
-                    self.session,
+                turn = self._commit_turn(
                     user_text=snap.user_text,
                     coach_text=snap.coach_text,
                     keywords=snap.keywords,
+                )
+                self._persist_message(
+                    "assistant",
+                    snap.coach_text,
+                    {"source": "ai", "ttsProvider": "deepgram"},
                 )
                 self._speaking = True
                 self._speak_started_at = time.perf_counter()
@@ -1127,11 +1594,15 @@ class LiveCallBridge:
             elif snap is not None and snap.coach_text:
                 # LLM ready, audio not yet — stream TTS now
                 wait_pre = int((time.perf_counter() - t_end) * 1000)
-                turn = self.coach.commit_text(
-                    self.session,
+                turn = self._commit_turn(
                     user_text=snap.user_text,
                     coach_text=snap.coach_text,
                     keywords=snap.keywords,
+                )
+                self._persist_message(
+                    "assistant",
+                    snap.coach_text,
+                    {"source": "ai", "ttsProvider": "deepgram"},
                 )
                 self._speaking = True
                 self._speak_started_at = time.perf_counter()
@@ -1193,18 +1664,20 @@ class LiveCallBridge:
             else:
                 # Cold path: LLM then sentence-chunk TTS
                 self._dbg("turn cold LLM start")
-                draft = await asyncio.to_thread(
-                    self.coach.draft_reply, self.session, text
-                )
+                draft = await asyncio.to_thread(self._draft_reply, text)
                 self._dbg(f"turn cold LLM done llm={draft.llm_ms}ms")
                 if generation != self._generation:
                     return
 
-                turn = self.coach.commit_text(
-                    self.session,
+                turn = self._commit_turn(
                     user_text=draft.user_text,
                     coach_text=draft.coach_text,
                     keywords=draft.keywords,
+                )
+                self._persist_message(
+                    "assistant",
+                    draft.coach_text,
+                    {"source": "ai", "ttsProvider": "deepgram"},
                 )
                 self._speaking = True
                 self._speak_started_at = time.perf_counter()
