@@ -16,6 +16,12 @@ _CORRECTION_REQUEST = re.compile(
 )
 _GOODBYE = re.compile(r"\b(bye|goodbye|got to go|i have to go|that's all|end (the )?call)\b", re.I)
 _TRANSLATE = re.compile(r"\b(what is the english (word|for)|how do you say|matlab kya)\b", re.I)
+_ACK_WORDS = frozenset(
+    """
+    yeah yes yep yup ok okay hmm uh oh right sure good fine correct true
+    that thats it's its
+    """.split()
+)
 
 
 def _trim(value: Any) -> str:
@@ -58,6 +64,31 @@ def detect_user_intent(text: str) -> str:
     if len(words) <= 2:
         return "SMALL_TALK"
     return "ANSWER"
+
+
+def is_low_content_turn(text: str) -> bool:
+    """Yeah / okay / 'I I' — do not spend an LLM turn or ask a new question."""
+    raw = text or ""
+    if "?" in raw:
+        return False
+    cleaned = "".join(
+        ch if ch.isalnum() or ch.isspace() else " "
+        for ch in raw.lower().replace("'", "")
+    )
+    words = cleaned.split()
+    if not words:
+        return True
+    joined = " ".join(words)
+    if any(
+        token in joined
+        for token in ("remember", "hobby", "hobbies", "told you", "my name", "from")
+    ):
+        return False
+    if all(word in _ACK_WORDS for word in words) and len(words) <= 6:
+        return True
+    if len(words) <= 2 and len(set(words)) == 1 and words[0] in _ACK_WORDS | {"i", "we"}:
+        return True
+    return False
 
 
 def is_off_topic_question(text: str, topic_title: str = "") -> bool:

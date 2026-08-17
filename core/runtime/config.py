@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 
 RUNTIME_CONFIG = {
-    "maxRecentMessages": 12,
-    "maxProfileFacts": 8,
+    "maxRecentMessages": 100,
+    "maxProfileFacts": 12,
     "maxLearningSignals": 5,
     "maxRelevantMemories": 5,
     "llmRetries": 0,
@@ -16,8 +16,8 @@ RUNTIME_CONFIG = {
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    max_recent_messages: int = 12
-    max_profile_facts: int = 8
+    max_recent_messages: int = 100
+    max_profile_facts: int = 12
     max_learning_signals: int = 5
     max_relevant_memories: int = 5
     llm_retries: int = 0

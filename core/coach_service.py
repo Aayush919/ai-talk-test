@@ -64,6 +64,7 @@ _CLARIFY_CUES = (
     "did not understand",
     "confused",
     "do you know",
+    "do you remember",
     "know about me",
     "tell me about me",
     "know my name",

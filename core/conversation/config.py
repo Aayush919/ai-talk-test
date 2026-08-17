@@ -10,8 +10,8 @@ CONVERSATION_CONFIG = {
     "maxCorrectionsPerSession": 4,
     "minCorrectionConfidence": 0.85,
     "minSttConfidence": 0.70,
-    "maxRecentQuestions": 8,
-    "maxEntities": 8,
+    "maxRecentQuestions": 48,
+    "maxEntities": 16,
     "maxSpokenSentences": 3,
 }
 
@@ -22,8 +22,8 @@ class ConversationConfig:
     max_corrections_per_session: int = 4
     min_correction_confidence: float = 0.85
     min_stt_confidence: float = 0.70
-    max_recent_questions: int = 8
-    max_entities: int = 8
+    max_recent_questions: int = 48
+    max_entities: int = 16
     max_spoken_sentences: int = 3
 
     @classmethod

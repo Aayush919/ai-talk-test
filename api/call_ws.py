@@ -23,6 +23,7 @@ from core.coach_service import (
     needs_fresh_reply,
     transcripts_compatible,
 )
+from core.conversation.engagement import is_low_content_turn
 from core import call_log
 from core.config import Settings
 from core.session import Session
@@ -1114,7 +1115,7 @@ class LiveCallBridge:
         if self._turn_task and not self._turn_task.done():
             return
         # Clarification / tiny replies: wait for final, don't guess early
-        if needs_fresh_reply(text):
+        if needs_fresh_reply(text) or is_low_content_turn(text):
             return
 
         # Identical line — keep current buffer
@@ -1136,7 +1137,7 @@ class LiveCallBridge:
                 return
             if self._turn_task and not self._turn_task.done():
                 return
-            if needs_fresh_reply(text):
+            if needs_fresh_reply(text) or is_low_content_turn(text):
                 return
             live = text
             token = self._spec_token + 1
@@ -1250,7 +1251,7 @@ class LiveCallBridge:
 
         self._dbg("freeze wait for first unit")
         # After speech_final, let the loop finish first sentence audio if close
-        deadline = time.perf_counter() + 1.15
+        deadline = time.perf_counter() + 2.25
         reason = "timeout"
         while time.perf_counter() < deadline:
             spec = self._spec
@@ -1462,6 +1463,15 @@ class LiveCallBridge:
         self._pending = ""
         if not text:
             self._dbg("schedule skip empty")
+            return
+        if is_low_content_turn(text):
+            self._persist_message(
+                "user",
+                text,
+                {"source": "voice", "sttProvider": "deepgram", "skipped": "ack"},
+            )
+            print(f"[call] skip ack (no LLM): {text!r}")
+            self._dbg(f"schedule skip ack: {text[:60]!r}")
             return
 
         if self._turn_task and not self._turn_task.done() and not self._speaking:
@@ -1746,6 +1756,15 @@ class LiveCallBridge:
             if self._queued.strip() and generation == self._generation:
                 queued = self._queued.strip()
                 self._queued = ""
+                if is_low_content_turn(queued):
+                    self._persist_message(
+                        "user",
+                        queued,
+                        {"source": "voice", "sttProvider": "deepgram", "skipped": "ack"},
+                    )
+                    self._dbg(f"drain skip ack: {queued[:60]!r}")
+                    self._dbg("turn idle listening")
+                    return
                 wait = max(0.0, self._speak_until - time.perf_counter())
                 self._dbg(f"drain queued in {wait:.2f}s -> {queued[:60]!r}")
 

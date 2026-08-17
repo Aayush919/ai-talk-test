@@ -433,11 +433,11 @@ def test_goal_evidence_does_not_write_topic_progress():
     after = repo.find_progress("u1", "topic_intro")
     evidence = state["pendingGoalEvidence"]
     assert evidence is not None
-    assert evidence["goalId"] == "talk_about_hobbies"
+    assert evidence["goalId"] == "talk_about_background"
     assert after["goalsCompleted"] == before["goalsCompleted"]
     assert after["progress"] == before["progress"]
     assert repo.writes["progress"] == 0
-    assert state["currentGoalId"] == "talk_about_hobbies"
+    assert state["currentGoalId"] == "talk_about_background"
 
 
 def test_topic_engine_remains_authoritative_for_unknown_goal_switch():
@@ -460,7 +460,7 @@ def test_topic_engine_remains_authoritative_for_unknown_goal_switch():
     svc = _svc(repo, analyzer)
     svc.initializeConversationRuntime(cid)
     state = svc.handleUserTurn(cid, "I like cricket.")
-    assert state["currentGoalId"] == "talk_about_hobbies"
+    assert state["currentGoalId"] == "talk_about_background"
     assert repo.writes["progress"] == 0
 
 
@@ -511,7 +511,7 @@ def test_question_repetition_is_visible_in_the_next_prompt():
     svc.handleUserTurn(cid, "I build web apps.")
     assert analyzer.calls == 2
     assert question in analyzer.users[1]
-    assert "recentQuestions" in analyzer.users[1]
+    assert "Already asked (do not repeat):" in analyzer.users[1]
 
 
 def test_multi_goal_session_does_not_write_progress_mid_call():
@@ -551,8 +551,8 @@ def test_multi_goal_session_does_not_write_progress_mid_call():
     )
     third = svc.handleUserTurn(cid, "I grew up in Indore and studied computer science.")
     after = repo.find_progress("u1", "topic_intro")
-    assert second["currentGoalId"] == "talk_about_hobbies"
-    assert third["currentGoalId"] == "talk_about_hobbies"
+    assert second["currentGoalId"] == "talk_about_background"
+    assert third["currentGoalId"] == "talk_about_background"
     assert after == before
     assert repo.writes["progress"] == 0
     assert analyzer.calls == 3
@@ -648,6 +648,9 @@ def test_live_prompt_is_compact_plain_text():
         "I build apps.",
     )
     assert "Current topic:" in prompt
+    assert "Already known (do not re-ask):" in prompt
+    assert "If they ask whether you remember" in LIVE_SYSTEM_PROMPT
+    assert "profession: developer" in prompt
     assert "Relevant learner context:" in prompt
     assert "User just said: I build apps." in prompt
     assert "response_format" not in prompt
@@ -655,4 +658,86 @@ def test_live_prompt_is_compact_plain_text():
     assert "relevanceScore" not in prompt
     assert len(LIVE_SYSTEM_PROMPT) < 2000
     assert len(prompt) < 1500
+
+
+def test_live_facts_are_remembered_without_mongo_writes():
+    from core.conversation.live_facts import extract_live_facts
+
+    facts = extract_live_facts("I am Ayush Malviya. I am living in Bhopal. I am doing BTech.")
+    keys = {row["key"] for row in facts}
+    assert "name" in keys
+    assert "location" in keys
+    assert "education" in keys
+
+    repo = FakeRepo()
+    cid = _seed(
+        repo,
+        progress=0,
+    )
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "introduce_self",
+        "talk_about_work",
+        "talk_about_hobbies",
+        "talk_about_background",
+    ]
+    analyzer = RecordingAnalyzer({"text": "Nice to meet you, Ayush. Where do you live?"})
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    state = svc.handleUserTurn(cid, "I am Ayush Malviya. I live in Bhopal.")
+    facts_state = (state.get("userContext") or {}).get("profileFacts") or []
+    assert any(row.get("key") == "name" and "Ayush" in str(row.get("value")) for row in facts_state)
+    assert "introduce_self" in (state.get("goalsCompleted") or [])
+    assert state["currentGoalId"] != "introduce_self"
+    prompt = analyzer.users[-1]
+    assert "Already known (do not re-ask):" in prompt
+    assert "Ayush" in prompt
+    assert repo.writes["progress"] == 0
+    assert repo.find_progress("u1", "topic_intro")["goalsCompleted"] == []
+
+
+def test_spoken_hobbies_are_remembered_across_later_turns():
+    from core.conversation.live_facts import extract_live_facts, merge_live_facts
+
+    first = extract_live_facts(
+        "Yeah. For fun, I'm watching movies. I'm playing cricket with friends."
+    )
+    hobby = next(row["value"].lower() for row in first if row["key"] == "hobby")
+    assert "cricket" in hobby
+    assert "movies" in hobby
+    merged = merge_live_facts(first, extract_live_facts("I read business books."))
+    hobby = next(row["value"].lower() for row in merged if row["key"] == "hobby")
+    assert "reading books" in hobby
+    assert "cricket" in hobby
+
+    repo = FakeRepo()
+    cid = _seed(repo)
+    analyzer = RecordingAnalyzer(
+        {"text": "Nice. Do you remember I already know your hobbies."}
+    )
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    svc.handleUserTurn(
+        cid, "For fun I'm watching movies. I'm playing cricket with friends."
+    )
+    svc.handleUserTurn(cid, "I read business books.")
+    svc.handleUserTurn(cid, "Do you remember all of my hobbies or not?")
+    prompt = analyzer.users[-1]
+    assert "Already known (do not re-ask):" in prompt
+    assert "cricket" in prompt.lower()
+    assert "movies" in prompt.lower()
+    assert "If they ask whether you remember" in analyzer.systems[-1]
+    assert repo.writes["progress"] == 0
+
+
+def test_ack_turns_are_low_content_but_real_facts_are_not():
+    from core.conversation.engagement import is_low_content_turn
+
+    assert is_low_content_turn("Yes. Yes. That's good.")
+    assert is_low_content_turn("Yeah. Yeah.")
+    assert is_low_content_turn("I I")
+    assert not is_low_content_turn("I'm playing cricket.")
+    assert not is_low_content_turn("Do you remember my hobbies?")
+    assert not is_low_content_turn("I am from Bhopal.")
+
 

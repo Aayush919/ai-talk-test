@@ -297,6 +297,11 @@ class ConversationRuntimeService:
             "shouldContinue": generated.get("shouldContinue", True),
             "sttConfidence": processed.get("sttConfidence"),
             "coachingStrategy": processed.get("coachingStrategy"),
+            "userContext": processed.get("userContext"),
+            "goalsCompleted": processed.get("goalsCompleted"),
+            "goalsRemaining": processed.get("goalsRemaining"),
+            "currentGoalId": processed.get("currentGoalId"),
+            "currentGoalIndex": processed.get("currentGoalIndex"),
         }
         return {
             "response": text,
@@ -347,8 +352,6 @@ class ConversationRuntimeService:
             "conversationTurn": turn,
             "shouldContinue": True,
         }
-        switched = apply_goal_switch(current, targetGoalId)
-        update.update(switched)
         meta = self._preview_meta.pop(cid, {})
         for key, value in meta.items():
             if key == "lastDecision":
@@ -356,8 +359,23 @@ class ConversationRuntimeService:
                 continue
             if value is not None:
                 update[key] = value
+        covered = {
+            str(item)
+            for item in (update.get("goalsCompleted") or current.get("goalsCompleted") or [])
+            if str(item).strip()
+        }
+        target = _trim(targetGoalId)
+        switched_by_llm = False
+        if target and target not in covered:
+            switched = apply_goal_switch({**current, **update}, target)
+            update.update(switched)
+            switched_by_llm = True
         self.graph.app.update_state(_thread_config(cid), update)
         latest = dict(self._checkpoint_values(cid))
+        # Live-fact goal advances stay in RAM. Qdrant only on an LLM goal switch
+        # so commit (before TTS) does not add retrieval latency.
+        if not switched_by_llm:
+            return self.getRuntimeState(cid)
         refreshed = self._refresh_memories_if_needed(
             cid,
             current,

@@ -12,6 +12,11 @@ from core.conversation.config import DEFAULT_CONVERSATION_CONFIG
 from core.conversation.correction import CorrectionService, empty_correction_state
 from core.conversation.engagement import detect_engagement, detect_user_intent
 from core.conversation.entities import extract_entities
+from core.conversation.live_facts import (
+    advance_session_goals,
+    extract_live_facts,
+    merge_live_facts,
+)
 from core.conversation.phase import next_phase
 from core.conversation.prompts import GENERATE_SYSTEM_PROMPT, build_generate_user_prompt
 from core.conversation.response import (
@@ -381,6 +386,19 @@ class RuntimeGraph:
             previous=list(state.get("lastMentionedEntities") or []),
             limit=self.conversation_config.max_entities,
         )
+        context = dict(state.get("userContext") or {})
+        facts = merge_live_facts(
+            context.get("profileFacts") or [],
+            extract_live_facts(text),
+            limit=self.config.max_profile_facts,
+        )
+        context["profileFacts"] = facts
+        goals = advance_session_goals(
+            topic_goals=list(state.get("topicGoals") or []),
+            goals_completed=list(state.get("goalsCompleted") or []),
+            goals_remaining=list(state.get("goalsRemaining") or []),
+            facts=facts,
+        )
         correction_state = dict(state.get("correctionState") or empty_correction_state())
         correction_state["correctionsGivenThisTurn"] = 0
         return {
@@ -389,6 +407,11 @@ class RuntimeGraph:
             "lastUserIntent": user_intent,
             "userEngagement": engagement,
             "lastMentionedEntities": entities,
+            "userContext": context,
+            "goalsCompleted": goals["goalsCompleted"],
+            "goalsRemaining": goals["goalsRemaining"],
+            "currentGoalId": goals["currentGoalId"],
+            "currentGoalIndex": goals["currentGoalIndex"],
             "sttConfidence": stt_value,
             "incomingSttConfidence": None,
             "coachingStrategy": strategy,

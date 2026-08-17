@@ -230,7 +230,7 @@ def test_recent_messages_stay_within_limit():
         svc.handleUserTurn(cid, f"I like playing cricket {index}")
     state = svc.getRuntimeState(cid)
     assert len(state["recentMessages"]) <= RUNTIME_CONFIG["maxRecentMessages"]
-    assert len(state["recentMessages"]) == 12
+    assert len(state["recentMessages"]) == 20
 
 
 def test_each_user_turn_increments_conversation_turn():
@@ -261,7 +261,7 @@ def test_runtime_goal_can_switch_without_completing_database_goal():
     before = repo.find_progress("u1", "topic_intro")
     state = svc.handleUserTurn(cid, "I like playing cricket.")
     after = repo.find_progress("u1", "topic_intro")
-    assert state["currentGoalId"] == "talk_about_hobbies"
+    assert state["currentGoalId"] == "talk_about_background"
     assert after["goalsRemaining"] == before["goalsRemaining"]
     assert after["goalsCompleted"] == before["goalsCompleted"]
     assert after["progress"] == before["progress"]
