@@ -25,6 +25,41 @@ CORRECTION_TYPES = frozenset(
         "NATURALNESS",
     }
 )
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirty": "30",
+}
+_STOP = frozenset(
+    "i a an the to at and then please usually around about am is are was were of in on".split()
+)
+_REFUSE_REPEAT = re.compile(
+    r"^\s*(no|nope|nah)\s*[.!]?\s*$|"
+    r"\b(i don't want to|don't want to repeat|not now|skip that|later)\b",
+    re.I,
+)
+_ASK_REPEAT = re.compile(
+    r"\b(?:please )?repeat(?: it)?(?: once)?\b|\btry saying\b|\bsay it (?:once|again)\b",
+    re.I,
+)
+_QUOTED = re.compile(r"['\"]([^'\"]{6,80})['\"]")
+_SAY_LINE = re.compile(
+    r"(?:you can say|try this|try saying|a more natural way is|"
+    r"let's say it this way|say it like this)[,:]?\s*['\"]?([^'\"\n]+)",
+    re.I,
+)
+_COOLDOWN_TURNS = 2
 
 
 def _trim(value: Any) -> str:
@@ -39,12 +74,149 @@ def _norm(value: Any) -> str:
 
 def empty_correction_state() -> dict[str, Any]:
     return {
+        "status": "idle",
+        "originalText": None,
+        "correctedText": None,
+        "errorType": None,
+        "confidence": 0.0,
+        "attempts": 0,
+        "lastCorrectionAt": None,
+        "clarifyGiven": False,
+        "lastOutcome": None,
         "correctionCandidates": [],
         "correctionsGivenThisTurn": 0,
         "correctionsGivenThisSession": 0,
         "recentCorrectionTypes": [],
         "recentOriginals": [],
     }
+
+
+def _fold_speech(value: Any) -> str:
+    text = _norm(value).replace(":", " ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    for word, digit in _NUMBER_WORDS.items():
+        text = re.sub(rf"\b{word}\b", digit, text)
+    return " ".join(text.split())
+
+
+def _content_tokens(text: str) -> list[str]:
+    return [part for part in _fold_speech(text).split() if part not in _STOP]
+
+
+def repeat_accepted(user_text: str, target: str) -> bool:
+    """Meaning + target structure, not exact string match."""
+    if not _trim(user_text) or not _trim(target):
+        return False
+    wanted = _content_tokens(target)
+    got = _content_tokens(user_text)
+    if not wanted or not got:
+        return _fold_speech(user_text) == _fold_speech(target)
+    stems_got = {token.rstrip("ing").rstrip("ed") for token in got}
+    missing = [
+        token
+        for token in wanted
+        if token not in got and token.rstrip("ing").rstrip("ed") not in stems_got
+    ]
+    return len(missing) <= max(0, len(wanted) // 4) and len(got) >= 2
+
+
+def extract_presented_correction(reply: str) -> str | None:
+    raw = _trim(reply)
+    if not raw or not _ASK_REPEAT.search(raw):
+        return None
+    quoted = _QUOTED.findall(raw)
+    if quoted:
+        return _trim(quoted[0]).strip(" .,!")
+    match = _SAY_LINE.search(raw)
+    if match:
+        return _trim(match.group(1)).split("Please")[0].strip(" .,!")
+    return None
+
+
+def correction_prompt_lines(
+    state: dict[str, Any] | None,
+    *,
+    turn: int = 0,
+) -> list[str]:
+    data = state or empty_correction_state()
+    status = _trim(data.get("status")) or "idle"
+    outcome = _trim(data.get("lastOutcome"))
+    target = _trim(data.get("correctedText"))
+    lines: list[str] = []
+    if outcome == "accepted":
+        lines.append(
+            "They repeated the corrected sentence (or close enough). "
+            "Praise briefly and continue the topic. Do not recast again."
+        )
+        return lines
+    if outcome == "dismissed":
+        lines.append(
+            "They did not repeat. Do not ask them to repeat. Continue the conversation."
+        )
+        return lines
+    if outcome == "clarify" or (status == "awaiting_repeat" and data.get("clarifyGiven")):
+        lines.append(
+            "They did not understand the correction. "
+            "Say once: try saying the sentence once. Then wait. Do not lecture."
+        )
+        if target:
+            lines.append(f"Target sentence: {target}")
+        return lines
+    if status == "awaiting_repeat" and target:
+        lines.append(f"Correction in progress. Target: '{target}'")
+        lines.append(
+            "If they said it (even a bit differently), praise and continue. "
+            "If they refused or talked about something else, do not ask to repeat."
+        )
+        return lines
+    session = int(data.get("correctionsGivenThisSession") or 0)
+    last_at = data.get("lastCorrectionAt")
+    if session >= 4:
+        lines.append("Correction cooldown. Do not correct this turn. Just talk.")
+        return lines
+    if last_at is not None and int(turn or 0) - int(last_at) <= _COOLDOWN_TURNS:
+        lines.append("Correction cooldown. Do not correct this turn. Just talk.")
+        return lines
+    lines.append(
+        "If there is one clear useful mistake, recast it in this same reply: "
+        "Nice! You can say, 'corrected sentence.' Please repeat it once. "
+        "Otherwise just talk. Never correct wanna/gonna/yeah or likely STT junk."
+    )
+    return lines
+
+
+def resolve_awaiting_repeat(
+    state: dict[str, Any] | None,
+    *,
+    user_text: str,
+    user_intent: str,
+) -> dict[str, Any]:
+    current = {**empty_correction_state(), **(state or {})}
+    if _trim(current.get("status")) != "awaiting_repeat":
+        current["lastOutcome"] = None
+        return current
+    target = _trim(current.get("correctedText"))
+    intent = _trim(user_intent)
+    if intent == "REFUSAL" or _REFUSE_REPEAT.search(_trim(user_text)):
+        current["status"] = "dismissed"
+        current["lastOutcome"] = "dismissed"
+        return current
+    if intent == "CONFUSION":
+        if current.get("clarifyGiven"):
+            current["status"] = "dismissed"
+            current["lastOutcome"] = "dismissed"
+        else:
+            current["clarifyGiven"] = True
+            current["lastOutcome"] = "clarify"
+            current["status"] = "awaiting_repeat"
+        return current
+    if repeat_accepted(user_text, target):
+        current["status"] = "completed"
+        current["lastOutcome"] = "accepted"
+        return current
+    current["status"] = "dismissed"
+    current["lastOutcome"] = "dismissed"
+    return current
 
 
 def _as_float(value: Any) -> float | None:
@@ -102,6 +274,8 @@ class CorrectionService:
         if candidate is None:
             return None
         state = correction_state or empty_correction_state()
+        if _trim(state.get("status")) == "awaiting_repeat" and user_intent != "CORRECTION_REQUEST":
+            return None
         requested = user_intent == "CORRECTION_REQUEST"
         if candidate["type"] == "PRONUNCIATION" and not pronunciation_evidence:
             return None
@@ -132,7 +306,7 @@ class CorrectionService:
         state: dict[str, Any],
         candidate: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        current = dict(state.get("correctionState") or empty_correction_state())
+        current = {**empty_correction_state(), **(state.get("correctionState") or {})}
         current["correctionsGivenThisTurn"] = 0
         if candidate is None:
             current["correctionCandidates"] = list(current.get("correctionCandidates") or [])
@@ -161,6 +335,58 @@ class CorrectionService:
                 }
             )
             current["correctionCandidates"] = pending[-6:]
+        return current
+
+    def after_spoken_reply(
+        self,
+        correction_state: dict[str, Any] | None,
+        *,
+        reply: str,
+        user_text: str,
+        user_intent: str,
+        turn: int,
+    ) -> dict[str, Any]:
+        current = {**empty_correction_state(), **(correction_state or {})}
+        outcome = _trim(current.get("lastOutcome"))
+        if outcome in {"accepted", "dismissed"}:
+            current["status"] = "idle"
+            current["originalText"] = None
+            current["correctedText"] = None
+            current["clarifyGiven"] = False
+            current["attempts"] = 0
+            current["lastOutcome"] = None
+            return current
+        if _trim(current.get("status")) == "awaiting_repeat":
+            return current
+        presented = extract_presented_correction(reply)
+        if not presented:
+            return current
+        if user_intent in {"MEMORY_PROBE", "REPEAT_COMPLAINT", "CONFUSION", "GOODBYE"}:
+            return current
+        session = int(current.get("correctionsGivenThisSession") or 0)
+        if (
+            session >= self.config.max_corrections_per_session
+            and user_intent != "CORRECTION_REQUEST"
+        ):
+            return current
+        last_at = current.get("lastCorrectionAt")
+        if last_at is not None and int(turn or 0) - int(last_at) <= _COOLDOWN_TURNS:
+            return current
+        originals = [_norm(item) for item in (current.get("recentOriginals") or [])]
+        if _norm(user_text) in originals and user_intent != "CORRECTION_REQUEST":
+            return current
+        current["status"] = "awaiting_repeat"
+        current["originalText"] = _trim(user_text) or None
+        current["correctedText"] = presented
+        current["attempts"] = 1
+        current["clarifyGiven"] = False
+        current["lastCorrectionAt"] = turn
+        current["lastOutcome"] = None
+        if int(current.get("correctionsGivenThisTurn") or 0) == 0:
+            current["correctionsGivenThisTurn"] = 1
+            current["correctionsGivenThisSession"] = session + 1
+        originals.append(_trim(user_text))
+        current["recentOriginals"] = [item for item in originals if item][-8:]
         return current
 
 

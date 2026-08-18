@@ -298,6 +298,7 @@ class ConversationRuntimeService:
             "sttConfidence": processed.get("sttConfidence"),
             "coachingStrategy": processed.get("coachingStrategy"),
             "userContext": processed.get("userContext"),
+            "callBoard": processed.get("callBoard"),
             "goalsCompleted": processed.get("goalsCompleted"),
             "goalsRemaining": processed.get("goalsRemaining"),
             "currentGoalId": processed.get("currentGoalId"),
@@ -405,6 +406,13 @@ class ConversationRuntimeService:
         if not values.get("conversationId"):
             raise ConversationNotFound()
         return public_runtime_state(values)
+
+    def is_awaiting_correction(self, conversationId: str) -> bool:
+        cid = _trim(conversationId)
+        if not cid:
+            return False
+        status = _trim((self._checkpoint_values(cid).get("correctionState") or {}).get("status"))
+        return status == "awaiting_repeat"
 
     def _require_active(self, conversation_id: str) -> dict[str, Any]:
         values = self._checkpoint_values(conversation_id)

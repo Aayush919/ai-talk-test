@@ -9,18 +9,47 @@ _REFUSAL = re.compile(
     r"\b(i don't want to|don't want to talk|not comfortable|skip that|change (the )?topic)\b",
     re.I,
 )
-_CONFUSION = re.compile(r"\b(i don't know|i dont know|not sure|what does .+ mean)\b", re.I)
+_CONFUSION = re.compile(
+    r"\b(i don't know|i dont know|not sure|what does .+ mean|"
+    r"i don't get|i dont get|don't get your point|dont get your point|"
+    r"i don't understand|i dont understand|what happened)\b",
+    re.I,
+)
 _CORRECTION_REQUEST = re.compile(
     r"\b(was (that|my english) correct|did i say (it|that) (right|correct)|correct my|how do i say)\b",
     re.I,
 )
 _GOODBYE = re.compile(r"\b(bye|goodbye|got to go|i have to go|that's all|end (the )?call)\b", re.I)
 _TRANSLATE = re.compile(r"\b(what is the english (word|for)|how do you say|matlab kya)\b", re.I)
+_REPEAT_COMPLAINT = re.compile(
+    r"\bagain and again\b|\bwhy (?:are you )?(?:again|repeating)\b|\bstop repeating\b",
+    re.I,
+)
+_MEMORY_PROBE = re.compile(
+    r"\bdo you (?:know|remember)\b|\bdo you even know\b|"
+    r"\byou know (?:what|my)\b|\bwhat (?:am i|did i|do i)\b|"
+    r"\btell me (?:what|my)\b|\bremember (?:what|my)\b",
+    re.I,
+)
 _ACK_WORDS = frozenset(
     """
     yeah yes yep yup ok okay hmm uh oh right sure good fine correct true
     that thats it's its
     """.split()
+)
+_KEEP_SHORT = frozenset(
+    {
+        "yoga",
+        "shower",
+        "cricket",
+        "breakfast",
+        "tea",
+        "coffee",
+        "office",
+        "coding",
+        "evening",
+        "morning",
+    }
 )
 
 
@@ -44,6 +73,14 @@ def detect_engagement(text: str) -> str:
     return "NORMAL"
 
 
+def is_memory_probe(text: str) -> bool:
+    return bool(_MEMORY_PROBE.search(_trim(text)))
+
+
+def is_confused_turn(text: str) -> bool:
+    return bool(_CONFUSION.search(_trim(text)))
+
+
 def detect_user_intent(text: str) -> str:
     raw = _trim(text)
     if not raw:
@@ -52,12 +89,16 @@ def detect_user_intent(text: str) -> str:
         return "GOODBYE"
     if _CORRECTION_REQUEST.search(raw):
         return "CORRECTION_REQUEST"
+    if is_memory_probe(raw):
+        return "MEMORY_PROBE"
+    if _REPEAT_COMPLAINT.search(raw):
+        return "REPEAT_COMPLAINT"
+    if is_confused_turn(raw):
+        return "CONFUSION"
     if _TRANSLATE.search(raw):
         return "QUESTION"
     if _REFUSAL.search(raw):
         return "REFUSAL"
-    if _CONFUSION.search(raw):
-        return "CONFUSION"
     if raw.endswith("?") or raw.lower().startswith(("what ", "why ", "how ", "where ", "when ")):
         return "QUESTION"
     words = raw.split()
@@ -81,9 +122,23 @@ def is_low_content_turn(text: str) -> bool:
     joined = " ".join(words)
     if any(
         token in joined
-        for token in ("remember", "hobby", "hobbies", "told you", "my name", "from")
+        for token in (
+            "remember",
+            "do you know",
+            "what am i",
+            "what did i",
+            "understand",
+            "get your point",
+            "hobby",
+            "hobbies",
+            "told you",
+            "my name",
+            "from",
+        )
     ):
         return False
+    if len(words) == 1 and words[0] not in _ACK_WORDS and words[0] not in _KEEP_SHORT:
+        return True
     if all(word in _ACK_WORDS for word in words) and len(words) <= 6:
         return True
     if len(words) <= 2 and len(set(words)) == 1 and words[0] in _ACK_WORDS | {"i", "we"}:

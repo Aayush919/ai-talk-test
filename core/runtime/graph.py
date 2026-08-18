@@ -9,7 +9,11 @@ from langgraph.graph import END, START, StateGraph
 
 from core import call_log
 from core.conversation.config import DEFAULT_CONVERSATION_CONFIG
-from core.conversation.correction import CorrectionService, empty_correction_state
+from core.conversation.correction import (
+    CorrectionService,
+    empty_correction_state,
+    resolve_awaiting_repeat,
+)
 from core.conversation.engagement import detect_engagement, detect_user_intent
 from core.conversation.entities import extract_entities
 from core.conversation.live_facts import (
@@ -26,6 +30,12 @@ from core.conversation.response import (
     parse_ai_response,
     question_key,
     spoken_text_only,
+)
+from core.conversation.session_board import (
+    allow_goal_switch,
+    empty_call_board,
+    pin_session_goals,
+    update_call_board,
 )
 from core.runtime.config import RuntimeConfig
 from core.runtime.state import (
@@ -185,6 +195,8 @@ def apply_goal_switch(state: dict[str, Any], target_goal_id: str | None) -> dict
         allowed = list(state.get("goalsRemaining") or []) + list(state.get("goalsCompleted") or [])
     if target not in allowed:
         return {}
+    if not allow_goal_switch(state.get("callBoard"), target):
+        return {}
     index = allowed.index(target) if target in allowed else None
     return {"currentGoalId": target, "currentGoalIndex": index}
 
@@ -293,6 +305,7 @@ class RuntimeGraph:
             "shouldContinue": True,
             "turnOutcome": None,
             "lastDecision": None,
+            "callBoard": empty_call_board(),
         }
         validate_runtime_state(loaded)
         return loaded
@@ -343,6 +356,7 @@ class RuntimeGraph:
             "lastUserIntent": None,
             "shouldContinue": True,
             "runtimeMode": "ready",
+            "callBoard": dict(state.get("callBoard") or empty_call_board()),
             "contextSession": None,
             "contextTopic": None,
             "contextProgress": None,
@@ -359,6 +373,13 @@ class RuntimeGraph:
         if not text:
             progress = "NOT_STARTED"
             needs_follow = True
+        elif user_intent in {"MEMORY_PROBE", "REPEAT_COMPLAINT"}:
+            progress = "IN_PROGRESS"
+            needs_follow = False
+        elif user_intent == "CONFUSION":
+            progress = "IN_PROGRESS"
+            needs_follow = True
+            engagement = "LOW"
         elif len(words) >= 6:
             progress = "GOOD"
             needs_follow = len(words) < 10
@@ -387,9 +408,11 @@ class RuntimeGraph:
             limit=self.conversation_config.max_entities,
         )
         context = dict(state.get("userContext") or {})
+        skip_slots = user_intent in {"MEMORY_PROBE", "CONFUSION", "REPEAT_COMPLAINT"}
+        incoming_facts = [] if skip_slots else extract_live_facts(text)
         facts = merge_live_facts(
             context.get("profileFacts") or [],
-            extract_live_facts(text),
+            incoming_facts,
             limit=self.config.max_profile_facts,
         )
         context["profileFacts"] = facts
@@ -399,7 +422,25 @@ class RuntimeGraph:
             goals_remaining=list(state.get("goalsRemaining") or []),
             facts=facts,
         )
-        correction_state = dict(state.get("correctionState") or empty_correction_state())
+        board = update_call_board(
+            board=state.get("callBoard"),
+            user_text=text,
+            topic_goals=list(state.get("topicGoals") or []),
+            current_goal_id=goals.get("currentGoalId") or state.get("currentGoalId"),
+            last_question=state.get("lastAssistantQuestion"),
+            skip_slots=skip_slots,
+        )
+        pinned = pin_session_goals(
+            topic_goals=list(state.get("topicGoals") or []),
+            goals_completed=goals["goalsCompleted"],
+            goals_remaining=goals["goalsRemaining"],
+            board=board,
+        )
+        correction_state = resolve_awaiting_repeat(
+            state.get("correctionState"),
+            user_text=text,
+            user_intent=user_intent,
+        )
         correction_state["correctionsGivenThisTurn"] = 0
         return {
             "lastUserMessage": text or None,
@@ -408,10 +449,11 @@ class RuntimeGraph:
             "userEngagement": engagement,
             "lastMentionedEntities": entities,
             "userContext": context,
-            "goalsCompleted": goals["goalsCompleted"],
-            "goalsRemaining": goals["goalsRemaining"],
-            "currentGoalId": goals["currentGoalId"],
-            "currentGoalIndex": goals["currentGoalIndex"],
+            "callBoard": board,
+            "goalsCompleted": pinned["goalsCompleted"],
+            "goalsRemaining": pinned["goalsRemaining"],
+            "currentGoalId": pinned["currentGoalId"],
+            "currentGoalIndex": pinned["currentGoalIndex"],
             "sttConfidence": stt_value,
             "incomingSttConfidence": None,
             "coachingStrategy": strategy,
@@ -523,6 +565,13 @@ class RuntimeGraph:
         outcome = dict(state.get("turnOutcome") or {})
         outcome["needsFollowUp"] = bool(decision.get("followUpNeeded", True))
         correction_state = self.corrections.apply_to_state(dict(state), correction)
+        correction_state = self.corrections.after_spoken_reply(
+            correction_state,
+            reply=reply,
+            user_text=user_text,
+            user_intent=user_intent,
+            turn=int(state.get("conversationTurn") or 0),
+        )
         return {
             "lastAssistantMessage": reply,
             "lastAssistantQuestion": question or extract_question(reply),

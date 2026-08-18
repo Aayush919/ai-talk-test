@@ -134,6 +134,11 @@ def test_engagement_and_intent_signals():
     assert detect_user_intent("Was my English correct?") == "CORRECTION_REQUEST"
     assert detect_user_intent("What does routine mean?") == "CONFUSION"
     assert detect_user_intent("Goodbye, I have to go.") == "GOODBYE"
+    assert detect_user_intent("Do you know what I am doing in my evening?") == "MEMORY_PROBE"
+    assert detect_user_intent("You know my morning routine?") == "MEMORY_PROBE"
+    assert detect_user_intent("Why are you again and again asking?") == "REPEAT_COMPLAINT"
+    assert detect_user_intent("What happened? I don't get your point.") == "CONFUSION"
+    assert detect_user_intent("Yeah. I don't understand.") == "CONFUSION"
 
 
 def test_parse_rejects_database_operations_and_keeps_spoken_text():
@@ -649,7 +654,7 @@ def test_live_prompt_is_compact_plain_text():
     )
     assert "Current topic:" in prompt
     assert "Already known (do not re-ask):" in prompt
-    assert "If they ask whether you remember" in LIVE_SYSTEM_PROMPT
+    assert "If they ask whether you know or remember" in LIVE_SYSTEM_PROMPT
     assert "profession: developer" in prompt
     assert "Relevant learner context:" in prompt
     assert "User just said: I build apps." in prompt
@@ -726,7 +731,7 @@ def test_spoken_hobbies_are_remembered_across_later_turns():
     assert "Already known (do not re-ask):" in prompt
     assert "cricket" in prompt.lower()
     assert "movies" in prompt.lower()
-    assert "If they ask whether you remember" in analyzer.systems[-1]
+    assert "If they ask whether you know or remember" in analyzer.systems[-1]
     assert repo.writes["progress"] == 0
 
 
@@ -780,6 +785,251 @@ def test_ack_turns_are_low_content_but_real_facts_are_not():
     assert is_low_content_turn("I I")
     assert not is_low_content_turn("I'm playing cricket.")
     assert not is_low_content_turn("Do you remember my hobbies?")
+    assert not is_low_content_turn("Do you know what I am doing in my evening?")
     assert not is_low_content_turn("I am from Bhopal.")
+    assert is_low_content_turn("Life.")
+    assert not is_low_content_turn("Yoga.")
+    assert not is_low_content_turn("Yeah. I don't understand.")
+
+
+def _daily_topic() -> dict:
+    return {
+        "_id": "topic_daily",
+        "title": "Daily Routine",
+        "slug": "a1-daily-routine",
+        "level": "A1",
+        "goals": [
+            {"key": "wake_up", "description": "User can say when they wake up."},
+            {"key": "morning", "description": "User can describe a simple morning activity."},
+            {"key": "work_or_study_day", "description": "User can say what they do during the day."},
+            {"key": "evening", "description": "User can describe an evening activity."},
+            {"key": "sleep", "description": "User can say when they go to sleep."},
+        ],
+    }
+
+
+def test_morning_chapter_stays_until_both_slots_are_done():
+    from core.conversation.session_board import pin_session_goals, update_call_board
+
+    repo = FakeRepo()
+    repo.topics = [_daily_topic()]
+    cid = _seed(repo, topic_id="topic_daily", progress=0)
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "wake_up",
+        "morning",
+        "work_or_study_day",
+        "evening",
+        "sleep",
+    ]
+    analyzer = RecordingAnalyzer({"text": "Nice. What else do you do after you wake up?"})
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    state = svc.handleUserTurn(cid, "I wake up at 5:30.")
+    assert state["currentGoalId"] == "morning"
+    prompt = analyzer.users[-1]
+    assert "Stay on this chapter until it is done: morning" in prompt
+    assert "evening" not in prompt.split("User just said:")[0].lower()
+    state = svc.handleUserTurn(cid, "Then I do yoga and I take a shower.")
+    assert "morning" in (state.get("goalsCompleted") or [])
+    assert "wake_up" in (state.get("goalsCompleted") or [])
+    assert state["currentGoalId"] == "morning"
+    state = svc.handleUserTurn(cid, "After that I go to the office.")
+    assert state["currentGoalId"] == "work_or_study_day"
+    assert repo.writes["progress"] == 0
+
+    board = update_call_board(
+        board=None,
+        user_text="After waking I do yoga.",
+        topic_goals=_daily_topic()["goals"],
+        current_goal_id="wake_up",
+    )
+    pinned = pin_session_goals(
+        topic_goals=_daily_topic()["goals"],
+        goals_completed=[],
+        goals_remaining=["wake_up", "morning", "work_or_study_day", "evening", "sleep"],
+        board=board,
+    )
+    assert pinned["currentGoalId"] == "morning"
+    assert pinned["callChapter"] == "morning"
+    assert "work_or_study_day" not in pinned["goalsCompleted"]
+    assert pinned["goalsRemaining"][0] != "wake_up"
+
+
+def test_memory_probe_lists_only_this_call_and_skips_mongo():
+    repo = FakeRepo()
+    repo.topics = [_daily_topic()]
+    cid = _seed(repo, topic_id="topic_daily", progress=0)
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "wake_up",
+        "morning",
+        "work_or_study_day",
+        "evening",
+        "sleep",
+    ]
+    analyzer = RecordingAnalyzer(
+        {"text": "So far you told me you do yoga in the morning. You have not told me your evening yet."}
+    )
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    svc.handleUserTurn(cid, "I wake up at 5:30 and then I do yoga.")
+    state = svc.handleUserTurn(cid, "Do you know what I am doing in my evening?")
+    prompt = analyzer.users[-1]
+    assert "So far this call they told you:" in prompt
+    assert "yoga" in prompt.lower()
+    assert "Never say you don't know" in prompt
+    assert "evening" not in (state.get("goalsCompleted") or [])
+    assert repo.writes["progress"] == 0
+    assert _raw(svc, cid).get("lastUserIntent") == "MEMORY_PROBE"
+
+
+def test_follow_spoken_chapter_not_wake_up_or_sleep():
+    repo = FakeRepo()
+    repo.topics = [_daily_topic()]
+    cid = _seed(repo, topic_id="topic_daily", progress=0)
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "wake_up",
+        "morning",
+        "work_or_study_day",
+        "evening",
+        "sleep",
+    ]
+    analyzer = RecordingAnalyzer({"text": "Okay. What do you do after that?"})
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    state = svc.handleUserTurn(cid, "taking shower, and after that, am, doing yoga.")
+    assert state["currentGoalId"] == "morning"
+    assert state["currentGoalId"] != "wake_up"
+    state = svc.handleUserTurn(cid, "I am in office in the evening time.")
+    assert state["currentGoalId"] == "evening"
+    assert state["currentGoalId"] != "sleep"
+    state = svc.handleUserTurn(cid, "I am. I think I wake up at 06:00 in the morning time.")
+    assert state["currentGoalId"] != "sleep"
+    assert _raw(svc, cid).get("callBoard", {}).get("chapter") == "morning"
+    state = svc.handleUserTurn(cid, "What happened? I don't get your point.")
+    prompt = analyzer.users[-1]
+    assert _raw(svc, cid).get("lastUserIntent") == "CONFUSION"
+    assert "simpler words" in prompt
+    assert repo.writes["progress"] == 0
+
+
+def test_stt_merge_keeps_both_thoughts_and_drops_garbage():
+    from core.conversation.stt_merge import merge_pending_stt
+
+    merged = merge_pending_stt(
+        "I'm doing, my press",
+        "taking shower, and after that, am, doing yoga.",
+    )
+    assert "press" in merged.lower()
+    assert "yoga" in merged.lower()
+    merged = merge_pending_stt(
+        "Okay. I am a I I am soft at",
+        "developer. I'm doing all the coding.",
+    )
+    assert "soft" in merged.lower()
+    assert "developer" in merged.lower()
+    merged = merge_pending_stt(
+        "developer. I'm doing all the coding.",
+        "Life.",
+    )
+    assert "developer" in merged.lower()
+    assert "life" not in merged.lower()
+
+
+def test_correction_repeat_is_fuzzy_not_exact():
+    from core.conversation.correction import (
+        extract_presented_correction,
+        repeat_accepted,
+        resolve_awaiting_repeat,
+        empty_correction_state,
+    )
+
+    target = "I wake up at 5."
+    assert repeat_accepted("I wake up at five.", target)
+    assert repeat_accepted("I usually wake up at five.", target)
+    assert repeat_accepted("I wake up at 5 and then I do yoga.", target)
+    assert not repeat_accepted("I usually do yoga after that.", target)
+    assert extract_presented_correction(
+        "Nice! You can say, 'I wake up at 5.' Please repeat it once."
+    ) == "I wake up at 5"
+    waiting = {
+        **empty_correction_state(),
+        "status": "awaiting_repeat",
+        "correctedText": target,
+    }
+    assert resolve_awaiting_repeat(
+        waiting, user_text="I wake up at five.", user_intent="ANSWER"
+    )["lastOutcome"] == "accepted"
+    assert resolve_awaiting_repeat(
+        waiting, user_text="I usually do yoga after that.", user_intent="ANSWER"
+    )["lastOutcome"] == "dismissed"
+    assert resolve_awaiting_repeat(
+        waiting, user_text="No.", user_intent="ANSWER"
+    )["lastOutcome"] == "dismissed"
+
+
+def test_correction_coach_enters_awaiting_repeat_from_spoken_reply():
+    from core.conversation.correction import empty_correction_state
+
+    repo = FakeRepo()
+    cid = _seed(repo)
+    analyzer = RecordingAnalyzer(
+        {"text": "Nice! You can say, 'I wake up at 5.' Please repeat it once."}
+    )
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    state = svc.handleUserTurn(cid, "I waking up at 5.")
+    cs = _raw(svc, cid)["correctionState"]
+    assert cs["status"] == "awaiting_repeat"
+    assert "wake up at 5" in (cs.get("correctedText") or "").lower()
+    assert "Please repeat" in (state["lastAssistantMessage"] or "")
+    assert repo.writes["progress"] == 0
+
+    svc.graph.app.update_state(
+        {"configurable": {"thread_id": cid}},
+        {
+            "correctionState": {
+                **empty_correction_state(),
+                "status": "awaiting_repeat",
+                "correctedText": "I wake up at 5.",
+                "correctionsGivenThisSession": 1,
+                "lastCorrectionAt": 1,
+            }
+        },
+    )
+    analyzer.payload = {"text": "Perfect! What do you usually do after that?"}
+    svc.handleUserTurn(cid, "I wake up at five.")
+    assert _raw(svc, cid)["correctionState"]["status"] == "idle"
+    assert "repeated the corrected sentence" in analyzer.users[-1]
+
+
+def test_correction_coach_drops_repeat_when_user_continues():
+    from core.conversation.correction import empty_correction_state
+
+    repo = FakeRepo()
+    cid = _seed(repo)
+    analyzer = RecordingAnalyzer(
+        {"text": "Nice! What kind of yoga do you usually do?"}
+    )
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    svc.graph.app.update_state(
+        {"configurable": {"thread_id": cid}},
+        {
+            "correctionState": {
+                **empty_correction_state(),
+                "status": "awaiting_repeat",
+                "correctedText": "I wake up at 5.",
+                "correctionsGivenThisSession": 1,
+                "lastCorrectionAt": 1,
+            }
+        },
+    )
+    svc.handleUserTurn(cid, "I usually do yoga after that.")
+    assert _raw(svc, cid)["correctionState"]["status"] == "idle"
+    assert "Do not ask them to repeat" in analyzer.users[-1]
+    assert repo.writes["progress"] == 0
 
 

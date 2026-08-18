@@ -151,6 +151,7 @@ class ConversationRuntimeState(BaseModel):
     lastAssistantQuestion: str | None = None
     lastUserAnswer: str | None = None
     pendingGoalEvidence: dict[str, Any] | None = None
+    callBoard: dict[str, Any] = Field(default_factory=dict)
 
 
 class RuntimeStateDict(TypedDict, total=False):
@@ -201,6 +202,7 @@ class RuntimeStateDict(TypedDict, total=False):
     recentQuestionTypes: list[str]
     correctionState: dict[str, Any]
     pendingGoalEvidence: dict[str, Any] | None
+    callBoard: dict[str, Any]
     sttConfidence: float | None
     incomingSttConfidence: float | None
     pronunciationEvidence: bool

@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.conversation.engagement import is_memory_probe
+
 _NAME = re.compile(
     r"\b(?:my name(?: is)?|this is|myself|i am|i'm)\s+"
     r"(?!living\b|from\b|doing\b|a\b|an\b|the\b|going\b|trying\b|stay(?:ing)?\b|"
@@ -55,6 +57,10 @@ _GOAL_FROM_FACT = {
     "hobby": ("hobbies", "talk_about_hobbies"),
     "preference": ("hobbies", "talk_about_hobbies"),
     "background": ("talk_about_background",),
+    "wake_up": ("wake_up",),
+    "morning": ("morning",),
+    "evening": ("evening",),
+    "work_or_study_day": ("work_or_study_day", "talk_about_work"),
 }
 _MERGE_KEYS = frozenset({"hobby", "hobbies", "preference"})
 _HOBBY_SKIP = re.compile(
@@ -102,7 +108,7 @@ def _hobby_values(text: str) -> list[str]:
 
 def extract_live_facts(text: str) -> list[dict[str, str]]:
     raw = _trim(text)
-    if not raw:
+    if not raw or is_memory_probe(raw):
         return []
     out: list[dict[str, str]] = []
     loc = _LOCATION.search(raw)
@@ -135,6 +141,14 @@ def extract_live_facts(text: str) -> list[dict[str, str]]:
         out.append({"key": "preference", "value": "does not listen to music"})
     if re.search(r"\bgrew up\b|\bbackground\b|\bstudied\b", lowered):
         out.append({"key": "background", "value": "mentioned"})
+    if re.search(r"\b(?:wake|woke|get up)\b", lowered) and re.search(
+        r"\d{1,2}", lowered
+    ):
+        out.append({"key": "wake_up", "value": raw[:80]})
+    if re.search(r"\byoga\b|\bshower\b|\bbreakfast\b|\bbrush\b", lowered):
+        out.append({"key": "morning", "value": raw[:80]})
+    if re.search(r"\bevening\b", lowered) and not re.search(r"\bdo you\b", lowered):
+        out.append({"key": "evening", "value": raw[:80]})
     return out
 
 

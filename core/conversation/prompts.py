@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from core.conversation.chat_context import CallChatContext
+from core.conversation.correction import correction_prompt_lines
 from core.conversation.live_facts import covered_goal_keys
+from core.conversation.session_board import CHAPTERS, board_known_lines
 from core.semantic.retrieval import compact_memory_context
 
 LIVE_RECENT_MESSAGES = 8  # fallback alias; live path uses CallChatContext
@@ -20,12 +22,15 @@ Have a natural conversation while helping the learner practice the current topic
 
 Rules:
 - This call's conversation is ground truth. If they already answered something, do not ask it again.
+- Stay on the current chapter. Follow what they just talked about. Do not drag them back to an old unanswered slot.
+- Morning means wake-up and morning routine; finish both before work, evening, or sleep.
 - Speak naturally. Usually 1-3 short sentences.
 - Ask at most one meaningful follow-up when useful.
 - Respond to what they just said. Do not sound like a questionnaire.
 - Do not repeat a question listed as already asked, even with different wording.
-- If a learner fact is already known, do not ask for it again. Acknowledge it and move to the next remaining goal.
-- If they ask whether you remember something, answer from this call's conversation and Already known.
+- If a learner fact is already known, do not ask for it again. Acknowledge it and move to the next remaining goal in this chapter.
+- If they ask whether you know or remember something, answer only from this call. Say what they already told you. Never say you don't know if So far this call has it.
+- If they say you are repeating, acknowledge and ask a new question in the same chapter.
 - Yeah, okay, and short acknowledgements are not a request for a new question.
 - Use relevant learner context naturally. Never say you have a memory or a stored profile.
 - Do not announce internals.
@@ -33,8 +38,8 @@ Rules:
 - If they refuse a topic, do not pressure them.
 - If they don't know, give a simpler, more specific question.
 - If they go slightly off-topic, follow a little, then return.
-- If a correction is necessary, keep it brief and natural inside the reply. No grammar lectures.
-- Do not correct informal English (wanna, gonna).
+- If a correction is useful, recast once in the same reply and ask them to repeat it once. Never lecture. Never correct wanna, gonna, or yeah.
+- Do not correct every mistake. Conversation first.
 
 Return ONLY the spoken response. No JSON, markdown, labels, analysis, or metadata.
 """.strip()
@@ -148,6 +153,10 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
         state.get("goalsCompleted") or [],
     )
     remaining = [item for item in remaining if item["key"] not in set(covered)]
+    chapter = _trim((state.get("callBoard") or {}).get("chapter"))
+    if chapter:
+        members = next((item for name, item in CHAPTERS if name == chapter), ())
+        remaining = [item for item in remaining if item["key"] in set(members)] or remaining
     current_goal = _goal_description(state) or _trim(state.get("currentGoalId")).replace("_", " ")
     current_key = _trim(state.get("currentGoalId"))
     if current_key in set(covered) and remaining:
@@ -158,10 +167,14 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
     level = _trim(state.get("topicLevel"))
     phase = _trim(state.get("conversationPhase")) or "START"
     engagement = _trim(state.get("userEngagement")) or "NORMAL"
+    known_this_call = board_known_lines(state.get("callBoard"))
+    intent = _trim(state.get("lastUserIntent"))
 
     lines = [
         f"Current topic: {title}" + (f" ({level})" if level else ""),
     ]
+    if chapter:
+        lines.append(f"Stay on this chapter until it is done: {chapter}")
     if recent:
         lines.append("This call (do not re-ask anything already answered here):")
         for item in recent:
@@ -170,6 +183,9 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
     if covered_qa:
         lines.append("Covered this call:")
         lines.extend(f"- {item}" for item in covered_qa)
+    if known_this_call:
+        lines.append("So far this call they told you:")
+        lines.extend(f"- {item}" for item in known_this_call)
     lines.append(f"Current goal: {current_goal}")
     if remaining:
         labels = "; ".join(_trim(item.get("description")) or item["key"] for item in remaining)
@@ -195,5 +211,30 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
             "The call is starting. Greet warmly and ask one easy question about the current goal. "
             "Do not name it as a lesson."
         )
+    if intent == "MEMORY_PROBE":
+        lines.append(
+            "They asked if you know or remember something. Answer from this call only. "
+            "Say 'so far you told me...' using So far this call. "
+            "Never say you don't know if that list has it. Do not ask a new question first."
+        )
+    elif intent == "REPEAT_COMPLAINT":
+        lines.append("They said you are repeating. Do not re-ask. Stay on this chapter.")
+    elif intent == "CONFUSION":
+        cs = state.get("correctionState") or {}
+        if _trim(cs.get("status")) != "awaiting_repeat" and _trim(cs.get("lastOutcome")) not in {
+            "clarify",
+            "accepted",
+            "dismissed",
+        }:
+            lines.append(
+                "They did not understand. Repeat the last question in simpler words. "
+                "Do not change topic. Do not ask something new."
+            )
+    lines.extend(
+        correction_prompt_lines(
+            state.get("correctionState"),
+            turn=int(state.get("conversationTurn") or 0),
+        )
+    )
     lines.append("Speak only the next spoken reply.")
     return "\n".join(lines)

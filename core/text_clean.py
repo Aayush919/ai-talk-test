@@ -48,8 +48,13 @@ def clip_spoken_reply(text: str, *, user_text: str = "") -> str:
         return ""
     allow_long = bool(_RECAP_ASK.search(user_text or ""))
     has_fix = bool(
-        re.search(r'"[^"]{6,}"', raw)
-        or re.search(r"\b(we don't say|say it like this|try it)\b", raw, re.I)
+        re.search(r"['\"][^'\"]{6,}['\"]", raw)
+        or re.search(
+            r"\b(we don't say|say it like this|try it|you can say|"
+            r"please repeat|a more natural way|let's say it this way)\b",
+            raw,
+            re.I,
+        )
     )
     max_words = 44 if (allow_long or has_fix) else 28
     parts = re.split(r"(?<=[.!?])\s+", raw)

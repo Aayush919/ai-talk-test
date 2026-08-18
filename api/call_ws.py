@@ -24,6 +24,7 @@ from core.coach_service import (
     transcripts_compatible,
 )
 from core.conversation.engagement import is_low_content_turn
+from core.conversation.stt_merge import merge_pending_stt
 from core import call_log
 from core.config import Settings
 from core.session import Session
@@ -1416,7 +1417,10 @@ class LiveCallBridge:
                         f"speaking={self._speaking}"
                     )
 
-                # Interrupt only on committed speech (not noisy partials / echo)
+                if message.is_final:
+                    self._pending = merge_pending_stt(self._pending, text)
+                    self._dbg(f"stt is_final pending={self._pending[:60]!r}")
+
                 if self._coach_busy():
                     words = text.split()
                     if (
@@ -1425,26 +1429,15 @@ class LiveCallBridge:
                     ):
                         await self._barge_in(
                             f"final={text!r}",
-                            interrupt_text=text,
+                            interrupt_text=self._pending or text,
                         )
                     return
 
                 if not message.speech_final:
                     live = text
-                    if self._pending and _same_utterance(self._pending, text):
-                        live = f"{self._pending} {text}".strip()
+                    if self._pending:
+                        live = self._pending
                     self._kick_speculative(live)
-
-                if message.is_final:
-                    if self._pending and not _same_utterance(self._pending, text):
-                        self._dbg(
-                            f"stt new utterance replace "
-                            f"{self._pending[:40]!r} -> {text[:40]!r}"
-                        )
-                        self._pending = text
-                    else:
-                        self._pending = f"{self._pending} {text}".strip()
-                    self._dbg(f"stt is_final pending={self._pending[:60]!r}")
                 if message.speech_final and self._pending:
                     self._dbg(f"stt speech_final -> schedule pending={self._pending[:60]!r}")
                     self._schedule_turn()
@@ -1458,13 +1451,26 @@ class LiveCallBridge:
             self._dbg(f"stt utterance_end -> schedule pending={self._pending[:60]!r}")
             self._schedule_turn()
 
+    def _awaiting_correction(self) -> bool:
+        rt = self.conversation_runtime
+        cid = getattr(self.session, "conversation_id", None) or ""
+        if rt is None or not cid:
+            return False
+        check = getattr(rt, "is_awaiting_correction", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check(cid))
+        except Exception:
+            return False
+
     def _schedule_turn(self) -> None:
         text = self._pending.strip()
         self._pending = ""
         if not text:
             self._dbg("schedule skip empty")
             return
-        if is_low_content_turn(text):
+        if is_low_content_turn(text) and not self._awaiting_correction():
             self._persist_message(
                 "user",
                 text,
@@ -1756,7 +1762,7 @@ class LiveCallBridge:
             if self._queued.strip() and generation == self._generation:
                 queued = self._queued.strip()
                 self._queued = ""
-                if is_low_content_turn(queued):
+                if is_low_content_turn(queued) and not self._awaiting_correction():
                     self._persist_message(
                         "user",
                         queued,
