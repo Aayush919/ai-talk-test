@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from core.conversation.engagement import (
+    detect_user_intent,
     is_confused_turn,
     is_low_content_turn,
     is_memory_probe,
@@ -45,11 +46,18 @@ _HINTS = (
     ),
     (
         "evening",
-        re.compile(r"\bevening\b", re.I),
+        re.compile(
+            r"\bevening\b|\bdinner\b|\bwatch(?:ing)? (?:tv|television|netflix)\b|"
+            r"\bafter work\b|\bafter office\b|\bgo for a walk\b",
+            re.I,
+        ),
     ),
     (
         "sleep",
-        re.compile(r"\bsleep\b|\bgo to bed\b|\bgo to sleep\b", re.I),
+        re.compile(
+            r"\bsleep\b|\bgo to bed\b|\bgo to sleep\b|\bsleep at\b|\bgood night\b",
+            re.I,
+        ),
     ),
 )
 
@@ -136,7 +144,7 @@ def update_call_board(
     skip_slots: bool = False,
 ) -> dict[str, Any]:
     """Follow what they just talked about. Do not drag back to an old empty slot."""
-    del current_goal_id, last_question
+    _ = last_question
     data = dict(board or empty_call_board())
     answered = dict(data.get("answered") or {})
     known = [str(item) for item in (data.get("known") or []) if str(item).strip()]
@@ -144,19 +152,38 @@ def update_call_board(
     text = _trim(user_text)
     skip = skip_slots or is_memory_probe(text) or is_confused_turn(text)
     spoken = None
+    current = _trim(current_goal_id)
+    repeat = detect_user_intent(text) == "REPEAT_COMPLAINT"
     if text and not skip:
         known = _remember_line(text, known)
-        if not is_low_content_turn(text):
+        if not is_low_content_turn(text) or repeat:
+            hinted: set[str] = set()
             for key, pattern in _HINTS:
-                if key in allowed and key not in answered and pattern.search(text):
-                    answered[key] = text[:80]
+                if key in allowed and pattern.search(text):
+                    hinted.add(key)
+                    if key not in answered:
+                        answered[key] = text[:80]
             spoken = detect_spoken_chapter(text, allowed)
+            other_hint = bool(hinted - ({current} if current else set()))
+            if (
+                current
+                and current in allowed
+                and current not in answered
+                and not other_hint
+            ):
+                answered[current] = text[:80]
     data["answered"] = answered
     data["known"] = known
     if spoken:
         data["chapter"] = spoken
     elif not data.get("chapter"):
         data["chapter"] = _first_incomplete_chapter(answered, allowed)
+    else:
+        open_chapter = _first_incomplete_chapter(answered, allowed)
+        members = next((item for name, item in CHAPTERS if name == data.get("chapter")), ())
+        present = [key for key in members if key in allowed]
+        if open_chapter and present and all(key in answered for key in present):
+            data["chapter"] = open_chapter
     return data
 
 
@@ -185,22 +212,8 @@ def pin_session_goals(
             for key in next((item for name, item in CHAPTERS if name == chapter), ())
             if key in set(keys)
         )
-    answered_here = [key for key in members if key in answered]
     incomplete_here = [key for key in members if key not in set(completed)]
-    parked: set[str] = set()
-    if answered_here:
-        last = answered_here[-1]
-        last_i = members.index(last)
-        later_open = [key for key in members[last_i:] if key not in set(completed)]
-        current = later_open[0] if later_open else last
-        parked = set(members[:last_i]) - set(completed)
-        show = [key for key in incomplete_here if key not in parked] or [current]
-        remaining = show + [
-            key
-            for key in remaining_all
-            if key not in set(show) and key not in parked
-        ]
-    elif incomplete_here:
+    if incomplete_here:
         current = incomplete_here[0]
         remaining = incomplete_here + [
             key for key in remaining_all if key not in set(incomplete_here)
@@ -244,3 +257,31 @@ def board_known_lines(board: dict[str, Any] | None) -> list[str]:
             lines.append(text)
             seen.add(text.lower())
     return lines[:10]
+
+
+_GOAL_QUESTIONS = {
+    "wake_up": "What time do you usually wake up?",
+    "morning": "What do you usually do in the morning after you wake up?",
+    "work_or_study_day": "What do you do during the day — work or study?",
+    "evening": "What do you usually do in the evening?",
+    "sleep": "What time do you usually go to sleep?",
+    "name": "What should I call you?",
+    "location": "Where are you from?",
+    "education_or_work": "Do you work or study?",
+    "hobbies": "What do you like to do in your free time?",
+    "future_goal": "What is one goal you have for the future?",
+}
+
+
+def next_goal_question(state: dict[str, Any] | None) -> str:
+    data = state or {}
+    current = _trim(data.get("currentGoalId"))
+    remaining = [_trim(item) for item in (data.get("goalsRemaining") or []) if _trim(item)]
+    key = current if (current and current in remaining) or not remaining else remaining[0]
+    if not key:
+        key = current
+    if key in _GOAL_QUESTIONS:
+        return _GOAL_QUESTIONS[key]
+    if key:
+        return f"Can you tell me about {key.replace('_', ' ')}?"
+    return "What else would you like to talk about?"

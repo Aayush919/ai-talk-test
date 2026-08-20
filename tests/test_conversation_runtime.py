@@ -101,6 +101,19 @@ class FakeRepo:
                 return dict(row)
         return None
 
+    def list_progress(self, user_id: str) -> list[dict]:
+        return [row for row in self.progress if row["userId"] == user_id]
+
+    def list_active_topics(self, level: str) -> list[dict]:
+        rows = [
+            topic
+            for topic in self.topics
+            if topic.get("isActive", True)
+            and (not level or not topic.get("level") or topic.get("level") == level)
+        ]
+        rows.sort(key=lambda item: int(item.get("order") or 0))
+        return rows
+
     def list_messages(self, conversation_id: str) -> list[dict]:
         raise AssertionError("runtime must not load lifetime messages")
 

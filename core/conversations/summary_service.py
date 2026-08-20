@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -30,6 +31,25 @@ SUMMARY_GENERATING = "GENERATING"
 SUMMARY_COMPLETED = "COMPLETED"
 SUMMARY_FAILED = "FAILED"
 _GOAL_STATUSES = frozenset({"COMPLETED", "PARTIAL", "NOT_ATTEMPTED"})
+_GOAL_STATUS_ALIASES = {
+    "COMPLETED": "COMPLETED",
+    "COMPLETE": "COMPLETED",
+    "DONE": "COMPLETED",
+    "SUCCESS": "COMPLETED",
+    "PARTIAL": "PARTIAL",
+    "PARTIALLY_COMPLETED": "PARTIAL",
+    "IN_PROGRESS": "PARTIAL",
+    "ATTEMPTED": "PARTIAL",
+    "INCOMPLETE": "PARTIAL",
+    "NOT_ATTEMPTED": "NOT_ATTEMPTED",
+    "UNATTEMPTED": "NOT_ATTEMPTED",
+    "NONE": "NOT_ATTEMPTED",
+    "SKIPPED": "NOT_ATTEMPTED",
+    "NA": "NOT_ATTEMPTED",
+    "N_A": "NOT_ATTEMPTED",
+}
+_ANALYSIS_ATTEMPTS = 3
+_JOB_ATTEMPTS = 3
 _MISTAKE_TYPES = frozenset(
     {"GRAMMAR", "VOCABULARY", "PRONUNCIATION", "FLUENCY", "OTHER"}
 )
@@ -167,6 +187,49 @@ def _fact_grounded(fact: str, corpus: set[str]) -> bool:
     return (len(missing) / len(tokens)) <= 0.34
 
 
+def _map_goal_status(value: Any) -> str | None:
+    raw = _trim(value).upper().replace("-", "_").replace(" ", "_")
+    raw = re.sub(r"[^A-Z0-9_]+", "_", raw).strip("_")
+    mapped = _GOAL_STATUS_ALIASES.get(raw)
+    if mapped in _GOAL_STATUSES:
+        return mapped
+    return None
+
+
+def _fallback_summary_text(messages: list[dict[str, Any]]) -> str:
+    bits = [
+        _trim(row.get("content"))
+        for row in _meaningful_user_messages(messages)
+    ]
+    text = " ".join(bit for bit in bits[:3] if bit).strip()
+    if len(text) > 400:
+        text = text[:400].rstrip() + "..."
+    return text
+
+
+def _analysis_has_signal(raw: dict[str, Any], analysis: dict[str, Any]) -> bool:
+    """Reject empty LLM payloads so they cannot COMPLETE and freeze topic progress."""
+    if _trim(raw.get("summary")):
+        return True
+    for row in analysis.get("goals") or []:
+        if isinstance(row, dict) and _trim(row.get("status")).upper() in {
+            "COMPLETED",
+            "PARTIAL",
+        }:
+            return True
+    for key in (
+        "keyPoints",
+        "mistakes",
+        "corrections",
+        "strengths",
+        "importantFacts",
+        "vocabulary",
+    ):
+        if analysis.get(key):
+            return True
+    return False
+
+
 def _as_str_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -252,6 +315,7 @@ class ConversationSummaryService:
         conversationId: str,
         *,
         userId: str | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         cid = _trim(conversationId)
         if not cid:
@@ -263,7 +327,11 @@ class ConversationSummaryService:
             if session.get("status") != COMPLETED:
                 raise ConversationNotCompleted()
             existing = self.repo.find_conversation_summary(cid)
-            if existing and existing.get("summaryStatus") == SUMMARY_COMPLETED:
+            if (
+                existing
+                and existing.get("summaryStatus") == SUMMARY_COMPLETED
+                and not force
+            ):
                 out = public_summary(existing)
                 if out:
                     return out
@@ -273,25 +341,18 @@ class ConversationSummaryService:
             metrics = conversation_metrics(messages)
             topic = self.repo.find_topic(session.get("topicId"))
             goals = _topic_goals(topic)
-            if self.analyzer is None:
-                raise SummaryGenerationFailed()
-            raw = self.analyzer.analyze_json(
-                system=ANALYSIS_SYSTEM_PROMPT,
-                user=build_analysis_user_prompt(
-                    topic=topic,
-                    goals=goals,
-                    transcript=_transcript(messages),
-                ),
-            )
-            if isinstance(raw, str):
-                raw = parse_json_object(raw)
-            if not isinstance(raw, dict):
-                raise SummaryGenerationFailed()
-            analysis = self._normalize_analysis(
-                raw, topic_goals=goals, metrics=metrics, messages=messages
+            analysis = self._analyze_conversation(
+                topic=topic,
+                goals=goals,
+                messages=messages,
+                metrics=metrics,
             )
             existing = self.repo.find_conversation_summary(cid)
-            if existing and existing.get("summaryStatus") == SUMMARY_COMPLETED:
+            if (
+                existing
+                and existing.get("summaryStatus") == SUMMARY_COMPLETED
+                and not force
+            ):
                 out = public_summary(existing)
                 if out:
                     return out
@@ -321,7 +382,12 @@ class ConversationSummaryService:
                 },
             )
             return out
-        except ConversationError:
+        except (
+            ConversationNotFound,
+            ConversationAccessDenied,
+            ConversationNotCompleted,
+            InsufficientConversationData,
+        ):
             raise
         except Exception as exc:  # noqa: BLE001
             call_log.error(
@@ -383,6 +449,58 @@ class ConversationSummaryService:
         if owner and str(session.get("userId") or "") != owner:
             raise ConversationAccessDenied()
 
+    def _analyze_conversation(
+        self,
+        *,
+        topic: dict[str, Any] | None,
+        goals: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        metrics: dict[str, int],
+    ) -> dict[str, Any]:
+        if self.analyzer is None:
+            raise SummaryGenerationFailed()
+        prompt = build_analysis_user_prompt(
+            topic=topic,
+            goals=goals,
+            transcript=_transcript(messages),
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, _ANALYSIS_ATTEMPTS + 1):
+            try:
+                raw = self.analyzer.analyze_json(
+                    system=ANALYSIS_SYSTEM_PROMPT,
+                    user=prompt,
+                )
+                if isinstance(raw, str):
+                    raw = parse_json_object(raw)
+                if not isinstance(raw, dict):
+                    raise SummaryGenerationFailed()
+                parsed = raw if isinstance(raw, dict) else {}
+                analysis = self._normalize_analysis(
+                    parsed,
+                    topic_goals=goals,
+                    metrics=metrics,
+                    messages=messages,
+                )
+                if not _analysis_has_signal(parsed, analysis):
+                    raise SummaryGenerationFailed()
+                return analysis
+            except (
+                ConversationNotFound,
+                ConversationAccessDenied,
+                ConversationNotCompleted,
+                InsufficientConversationData,
+            ):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                call_log.warn(
+                    "SUMMARY",
+                    f"analysis attempt {attempt}/{_ANALYSIS_ATTEMPTS} failed: {exc}",
+                    extra={"attempt": attempt},
+                )
+        raise last_error or SummaryGenerationFailed()
+
     def _normalize_analysis(
         self,
         raw: dict[str, Any],
@@ -391,7 +509,7 @@ class ConversationSummaryService:
         metrics: dict[str, int],
         messages: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        summary = _trim(raw.get("summary"))
+        summary = _trim(raw.get("summary")) or _fallback_summary_text(messages)
         if not summary:
             raise SummaryGenerationFailed()
         corpus = _corpus(messages)
@@ -436,9 +554,9 @@ class ConversationSummaryService:
                 if not isinstance(item, dict):
                     continue
                 goal_id = _trim(item.get("goalId") or item.get("key"))
-                status = _trim(item.get("status")).upper()
-                if not goal_id or status not in _GOAL_STATUSES:
-                    raise SummaryGenerationFailed()
+                status = _map_goal_status(item.get("status"))
+                if not goal_id or status is None:
+                    continue
                 by_id[goal_id] = {
                     "goalId": goal_id,
                     "status": status,
@@ -534,65 +652,114 @@ def run_summary_job(
     profile_service: Any = None,
     learning_service: Any = None,
     semantic_service: Any = None,
+    runtime_snapshot: dict[str, Any] | None = None,
 ) -> None:
     """Best-effort background hook. Never changes session COMPLETED → FAILED."""
     if service is None or not conversation_id:
         return
-    try:
-        result = service.generateConversationSummary(conversation_id, userId=user_id)
-    except (InsufficientConversationData, ConversationNotCompleted) as exc:
-        call_log.info(
-            "SUMMARY",
-            exc.code,
-            extra={"conversationId": conversation_id, "userId": user_id},
-        )
-        return
-    except ConversationError as exc:
-        call_log.warn(
-            "SUMMARY",
-            exc.code,
-            extra={"conversationId": conversation_id, "userId": user_id},
-        )
-        return
-    except Exception as exc:  # noqa: BLE001
-        call_log.error(
-            "SUMMARY",
-            f"job skip: {exc}",
-            extra={"conversationId": conversation_id, "userId": user_id},
-        )
-        return
+    result: dict[str, Any] | None = None
+    for attempt in range(1, _JOB_ATTEMPTS + 1):
+        try:
+            result = service.generateConversationSummary(
+                conversation_id, userId=user_id
+            )
+            break
+        except ConversationNotCompleted as exc:
+            call_log.info(
+                "SUMMARY",
+                exc.code,
+                extra={"conversationId": conversation_id, "userId": user_id},
+            )
+            return
+        except InsufficientConversationData as exc:
+            if attempt < _JOB_ATTEMPTS:
+                call_log.warn(
+                    "SUMMARY",
+                    f"{exc.code} — retry {attempt}/{_JOB_ATTEMPTS}",
+                    extra={
+                        "conversationId": conversation_id,
+                        "userId": user_id,
+                        "attempt": attempt,
+                    },
+                )
+                time.sleep(1.2 * attempt)
+                continue
+            call_log.info(
+                "SUMMARY",
+                exc.code,
+                extra={"conversationId": conversation_id, "userId": user_id},
+            )
+            return
+        except ConversationError as exc:
+            call_log.warn(
+                "SUMMARY",
+                exc.code,
+                extra={"conversationId": conversation_id, "userId": user_id},
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            call_log.error(
+                "SUMMARY",
+                f"job skip: {exc}",
+                extra={"conversationId": conversation_id, "userId": user_id},
+            )
+            return
     if (result or {}).get("summaryStatus") != "COMPLETED":
         return
     if progress_service is not None:
-        try:
-            progress_service.updateTopicProgressFromSummary(
-                conversation_id, userId=user_id
-            )
-        except Exception as exc:  # noqa: BLE001
-            code = getattr(exc, "code", None) or "TOPIC_PROGRESS_UPDATE_FAILED"
-            call_log.error(
-                "PROGRESS",
-                code,
-                extra={
-                    "conversationId": conversation_id,
-                    "userId": user_id,
-                    "detail": str(exc)[:240],
-                },
-            )
-        try:
-            evaluate = getattr(progress_service, "evaluateAfterConversation", None)
-            if callable(evaluate):
-                evaluate(conversation_id, userId=user_id)
-        except Exception as exc:  # noqa: BLE001
-            call_log.error(
-                "TOPIC",
-                getattr(exc, "code", None) or "TOPIC_ENGINE_EVALUATE_FAILED",
-                extra={
-                    "conversationId": conversation_id,
-                    "userId": user_id,
-                    "detail": str(exc)[:240],
-                },
-            )
+        practiced = list((runtime_snapshot or {}).get("practicedTopics") or [])
+        live_completed = list((runtime_snapshot or {}).get("goalsCompleted") or [])
+        used_runtime = False
+        if practiced or live_completed:
+            try:
+                updater = getattr(progress_service, "updateFromPracticedCall", None)
+                if callable(updater):
+                    updater(
+                        conversation_id,
+                        runtime_snapshot,
+                        userId=user_id,
+                    )
+                    used_runtime = True
+            except Exception as exc:  # noqa: BLE001
+                call_log.error(
+                    "PROGRESS",
+                    getattr(exc, "code", None) or "TOPIC_PROGRESS_UPDATE_FAILED",
+                    extra={
+                        "conversationId": conversation_id,
+                        "userId": user_id,
+                        "detail": str(exc)[:240],
+                    },
+                )
+        if not used_runtime:
+            try:
+                progress_service.updateTopicProgressFromSummary(
+                    conversation_id, userId=user_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                code = getattr(exc, "code", None) or "TOPIC_PROGRESS_UPDATE_FAILED"
+                call_log.error(
+                    "PROGRESS",
+                    code,
+                    extra={
+                        "conversationId": conversation_id,
+                        "userId": user_id,
+                        "detail": str(exc)[:240],
+                    },
+                )
+            try:
+                evaluate = getattr(progress_service, "evaluateAfterConversation", None)
+                if callable(evaluate):
+                    evaluate(conversation_id, userId=user_id)
+            except Exception as exc:  # noqa: BLE001
+                call_log.error(
+                    "TOPIC",
+                    getattr(exc, "code", None) or "TOPIC_ENGINE_EVALUATE_FAILED",
+                    extra={
+                        "conversationId": conversation_id,
+                        "userId": user_id,
+                        "detail": str(exc)[:240],
+                    },
+                )
     if profile_service is not None:
         try:
             profile_service.extractAndUpdateUserProfileMemory(

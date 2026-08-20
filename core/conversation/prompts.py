@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
+from core.clock import local_now_line
 from core.conversation.chat_context import CallChatContext
 from core.conversation.correction import correction_prompt_lines
 from core.conversation.live_facts import covered_goal_keys
@@ -30,7 +32,7 @@ Rules:
 - Do not repeat a question listed as already asked, even with different wording.
 - If a learner fact is already known, do not ask for it again. Acknowledge it and move to the next remaining goal in this chapter.
 - If they ask whether you know or remember something, answer only from this call. Say what they already told you. Never say you don't know if So far this call has it.
-- If they say you are repeating, acknowledge and ask a new question in the same chapter.
+- If they say you are repeating, acknowledge and ask a new remaining-goal question. Never re-ask a locked goal.
 - Yeah, okay, and short acknowledgements are not a request for a new question.
 - Use relevant learner context naturally. Never say you have a memory or a stored profile.
 - Do not announce internals.
@@ -38,6 +40,7 @@ Rules:
 - If they refuse a topic, do not pressure them.
 - If they don't know, give a simpler, more specific question.
 - If they go slightly off-topic, follow a little, then return.
+- You already know today's local day, date, year, and time from Local now. Use them. Never ask what day or time it is.
 - If a correction is useful, recast once in the same reply and ask them to repeat it once. Never lecture. Never correct wanna, gonna, or yeah.
 - Do not correct every mistake. Conversation first.
 
@@ -113,7 +116,12 @@ def _asked_for_prompt(questions: list[Any]) -> list[str]:
     return lines
 
 
-def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
+def build_generate_user_prompt(
+    state: dict[str, Any],
+    user_text: str,
+    *,
+    now: datetime | None = None,
+) -> str:
     """Compact live context. Not a LangGraph/Mongo dump."""
     memories = compact_memory_context(
         [
@@ -154,9 +162,12 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
     )
     remaining = [item for item in remaining if item["key"] not in set(covered)]
     chapter = _trim((state.get("callBoard") or {}).get("chapter"))
+    chapter_open = False
     if chapter:
         members = next((item for name, item in CHAPTERS if name == chapter), ())
-        remaining = [item for item in remaining if item["key"] in set(members)] or remaining
+        in_chapter = [item for item in remaining if item["key"] in set(members)]
+        chapter_open = bool(in_chapter)
+        remaining = in_chapter or remaining
     current_goal = _goal_description(state) or _trim(state.get("currentGoalId")).replace("_", " ")
     current_key = _trim(state.get("currentGoalId"))
     if current_key in set(covered) and remaining:
@@ -171,10 +182,20 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
     intent = _trim(state.get("lastUserIntent"))
 
     lines = [
+        local_now_line(now=now),
         f"Current topic: {title}" + (f" ({level})" if level else ""),
     ]
-    if chapter:
+    if chapter and chapter_open:
         lines.append(f"Stay on this chapter until it is done: {chapter}")
+    elif chapter:
+        lines.append(f"This chapter is done: {chapter}. Move to the next remaining goal.")
+    locked = [
+        str(item)
+        for item in (state.get("goalsCompleted") or [])
+        if str(item).strip()
+    ]
+    if locked:
+        lines.append("Already covered this call (do not re-ask): " + ", ".join(locked[:8]))
     if recent:
         lines.append("This call (do not re-ask anything already answered here):")
         for item in recent:
@@ -218,7 +239,10 @@ def build_generate_user_prompt(state: dict[str, Any], user_text: str) -> str:
             "Never say you don't know if that list has it. Do not ask a new question first."
         )
     elif intent == "REPEAT_COMPLAINT":
-        lines.append("They said you are repeating. Do not re-ask. Stay on this chapter.")
+        lines.append(
+            "They said you are repeating. Acknowledge that. Do not re-ask. "
+            "Ask one new question about the current remaining goal."
+        )
     elif intent == "CONFUSION":
         cs = state.get("correctionState") or {}
         if _trim(cs.get("status")) != "awaiting_repeat" and _trim(cs.get("lastOutcome")) not in {

@@ -137,6 +137,8 @@ def test_engagement_and_intent_signals():
     assert detect_user_intent("Do you know what I am doing in my evening?") == "MEMORY_PROBE"
     assert detect_user_intent("You know my morning routine?") == "MEMORY_PROBE"
     assert detect_user_intent("Why are you again and again asking?") == "REPEAT_COMPLAINT"
+    assert detect_user_intent("I already told you I am doing") == "REPEAT_COMPLAINT"
+    assert detect_user_intent("You already asked me that.") == "REPEAT_COMPLAINT"
     assert detect_user_intent("What happened? I don't get your point.") == "CONFUSION"
     assert detect_user_intent("Yeah. I don't understand.") == "CONFUSION"
 
@@ -653,6 +655,8 @@ def test_live_prompt_is_compact_plain_text():
         "I build apps.",
     )
     assert "Current topic:" in prompt
+    assert "Local now (India):" in prompt
+    assert "Do not ask what day or time it is" in prompt
     assert "Already known (do not re-ask):" in prompt
     assert "If they ask whether you know or remember" in LIVE_SYSTEM_PROMPT
     assert "profession: developer" in prompt
@@ -661,8 +665,8 @@ def test_live_prompt_is_compact_plain_text():
     assert "response_format" not in prompt
     assert "completionConfidence" not in prompt
     assert "relevanceScore" not in prompt
-    assert len(LIVE_SYSTEM_PROMPT) < 2000
-    assert len(prompt) < 1500
+    assert len(LIVE_SYSTEM_PROMPT) < 2400
+    assert len(prompt) < 1800
 
 
 def test_live_facts_are_remembered_without_mongo_writes():
@@ -833,9 +837,9 @@ def test_morning_chapter_stays_until_both_slots_are_done():
     state = svc.handleUserTurn(cid, "Then I do yoga and I take a shower.")
     assert "morning" in (state.get("goalsCompleted") or [])
     assert "wake_up" in (state.get("goalsCompleted") or [])
-    assert state["currentGoalId"] == "morning"
-    state = svc.handleUserTurn(cid, "After that I go to the office.")
     assert state["currentGoalId"] == "work_or_study_day"
+    state = svc.handleUserTurn(cid, "After that I go to the office.")
+    assert state["currentGoalId"] == "evening"
     assert repo.writes["progress"] == 0
 
     board = update_call_board(
@@ -850,10 +854,10 @@ def test_morning_chapter_stays_until_both_slots_are_done():
         goals_remaining=["wake_up", "morning", "work_or_study_day", "evening", "sleep"],
         board=board,
     )
-    assert pinned["currentGoalId"] == "morning"
+    assert pinned["currentGoalId"] == "wake_up"
     assert pinned["callChapter"] == "morning"
     assert "work_or_study_day" not in pinned["goalsCompleted"]
-    assert pinned["goalsRemaining"][0] != "wake_up"
+    assert pinned["goalsRemaining"][0] == "wake_up"
 
 
 def test_memory_probe_lists_only_this_call_and_skips_mongo():
@@ -900,13 +904,13 @@ def test_follow_spoken_chapter_not_wake_up_or_sleep():
     svc = _svc(repo, analyzer)
     svc.initializeConversationRuntime(cid)
     state = svc.handleUserTurn(cid, "taking shower, and after that, am, doing yoga.")
-    assert state["currentGoalId"] == "morning"
-    assert state["currentGoalId"] != "wake_up"
+    assert "morning" in (state.get("goalsCompleted") or [])
+    assert state["currentGoalId"] == "wake_up"
+    assert _raw(svc, cid).get("callBoard", {}).get("chapter") == "morning"
     state = svc.handleUserTurn(cid, "I am in office in the evening time.")
-    assert state["currentGoalId"] == "evening"
+    assert "evening" in (state.get("goalsCompleted") or [])
     assert state["currentGoalId"] != "sleep"
     state = svc.handleUserTurn(cid, "I am. I think I wake up at 06:00 in the morning time.")
-    assert state["currentGoalId"] != "sleep"
     assert _raw(svc, cid).get("callBoard", {}).get("chapter") == "morning"
     state = svc.handleUserTurn(cid, "What happened? I don't get your point.")
     prompt = analyzer.users[-1]
@@ -1030,6 +1034,85 @@ def test_correction_coach_drops_repeat_when_user_continues():
     svc.handleUserTurn(cid, "I usually do yoga after that.")
     assert _raw(svc, cid)["correctionState"]["status"] == "idle"
     assert "Do not ask them to repeat" in analyzer.users[-1]
+    assert repo.writes["progress"] == 0
+
+
+def test_already_told_you_moves_off_repeated_goal():
+    from core.conversation.response import is_similar_question
+
+    assert is_similar_question(
+        "What time do you usually wake up?",
+        "What time do you wake up in the morning?",
+    )
+    assert not is_similar_question(
+        "What do you usually do in the evening?",
+        "What time do you usually wake up?",
+    )
+
+    repo = FakeRepo()
+    repo.topics = [_daily_topic()]
+    cid = _seed(repo, topic_id="topic_daily", progress=0)
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "wake_up",
+        "morning",
+        "work_or_study_day",
+        "evening",
+        "sleep",
+    ]
+    analyzer = RecordingAnalyzer({"text": "What time do you usually wake up?"})
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    svc.handleUserTurn(cid, "I wake up at 5:30.")
+    svc.handleUserTurn(cid, "Then I do yoga and I take a shower.")
+    state = svc.handleUserTurn(cid, "I already told you I am doing yoga.")
+    spoken = (state.get("lastAssistantMessage") or "").lower()
+    assert "wake" not in spoken
+    assert "already" in spoken or "right" in spoken
+    assert state["currentGoalId"] == "work_or_study_day"
+    assert repo.writes["progress"] == 0
+
+
+def test_covering_all_goals_switches_to_next_topic_in_same_call():
+    daily = {**_daily_topic(), "order": 1, "isActive": True}
+    family = {
+        "_id": "topic_family",
+        "title": "Family and Friends",
+        "slug": "a1-family-friends",
+        "level": "A1",
+        "order": 2,
+        "isActive": True,
+        "goals": [
+            {"key": "family_members", "description": "User can name family members."},
+        ],
+    }
+    repo = FakeRepo()
+    repo.topics = [daily, family]
+    cid = _seed(repo, topic_id="topic_daily", progress=0)
+    repo.progress[0]["goalsCompleted"] = []
+    repo.progress[0]["goalsRemaining"] = [
+        "wake_up",
+        "morning",
+        "work_or_study_day",
+        "evening",
+        "sleep",
+    ]
+    analyzer = RecordingAnalyzer({"text": "Nice. What do you do after that?"})
+    svc = _svc(repo, analyzer)
+    svc.initializeConversationRuntime(cid)
+    svc.handleUserTurn(
+        cid, "I wake up at 5:30 then I do yoga and I go to the office."
+    )
+    state = svc.handleUserTurn(
+        cid, "In the evening I watch TV and I sleep at 11."
+    )
+    assert state["topicId"] == "topic_family"
+    assert state["topicTitle"] == "Family and Friends"
+    practiced = state.get("practicedTopics") or []
+    assert practiced
+    assert practiced[0]["topicId"] == "topic_daily"
+    assert practiced[0]["progress"] == 100
+    assert state["currentGoalId"] == "family_members"
     assert repo.writes["progress"] == 0
 
 

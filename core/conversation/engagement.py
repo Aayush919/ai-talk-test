@@ -22,7 +22,9 @@ _CORRECTION_REQUEST = re.compile(
 _GOODBYE = re.compile(r"\b(bye|goodbye|got to go|i have to go|that's all|end (the )?call)\b", re.I)
 _TRANSLATE = re.compile(r"\b(what is the english (word|for)|how do you say|matlab kya)\b", re.I)
 _REPEAT_COMPLAINT = re.compile(
-    r"\bagain and again\b|\bwhy (?:are you )?(?:again|repeating)\b|\bstop repeating\b",
+    r"\bagain and again\b|\bwhy (?:are you )?(?:again|repeating)\b|\bstop repeating\b|"
+    r"\balready told you\b|\bi already told\b|\bi already said\b|"
+    r"\byou already (?:asked|told)\b|\bkeep repeating\b|\bsame question\b",
     re.I,
 )
 _MEMORY_PROBE = re.compile(

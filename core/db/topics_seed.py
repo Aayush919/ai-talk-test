@@ -7,7 +7,7 @@ from typing import Any
 
 LEVELS = ("A1", "A2", "B1", "B2", "C1")
 
-_CRITERIA = {"minimumGoals": 4, "minimumConversationSeconds": 300}
+_CRITERIA = {"minimumGoals": 5, "minimumConversationSeconds": 300}
 
 _FOCUS = {
     "A1": (

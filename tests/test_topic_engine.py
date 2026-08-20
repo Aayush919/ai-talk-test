@@ -229,7 +229,7 @@ def test_completed_topic_advances_to_next_global_topic():
     assert engine.repo.find_in_progress("u1")["topicId"] == "t2"
 
 
-def test_completion_uses_topic_minimum_goals():
+def test_partial_goals_do_not_complete_even_with_long_call():
     engine = _engine()
     engine.getPracticePlan("u1")
     row = engine.repo.find_in_progress("u1")
@@ -237,11 +237,11 @@ def test_completion_uses_topic_minimum_goals():
     row["goalsRemaining"] = ["g5"]
     row["progress"] = 80
     topic = engine.repo.find_topic("t1")
-    assert topic_meets_completion(topic, row, duration_seconds=400) is True
+    assert topic_meets_completion(topic, row, duration_seconds=400) is False
     cid = _session(engine.repo, duration=400)
     result = engine.evaluateAfterConversation(cid, userId="u1")
-    assert result["action"] == NEXT
-    assert engine.repo.find_progress("u1", "t1")["status"] == "COMPLETED"
+    assert result["action"] == CONTINUE
+    assert engine.repo.find_progress("u1", "t1")["status"] == "IN_PROGRESS"
 
 
 def test_short_call_below_minimum_time_does_not_complete_on_partial_goals():

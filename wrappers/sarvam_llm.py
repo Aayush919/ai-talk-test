@@ -160,7 +160,7 @@ class SarvamCoach:
                 "model": self.model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 1800,
+                "max_tokens": 4096,
                 "n": 1,
                 "response_format": {"type": "json_object"},
                 "reasoning_effort": None,

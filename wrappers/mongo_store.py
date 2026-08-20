@@ -353,6 +353,74 @@ class MongoStore:
             return_document=ReturnDocument.AFTER,
         )
 
+    def clear_processed_conversation(
+        self,
+        *,
+        user_id: str,
+        topic_id,
+        conversation_id: str,
+    ) -> None:
+        """Let this conversation be applied again after a better summary."""
+        from bson import ObjectId
+
+        uid = str(user_id or "").strip()
+        cid = str(conversation_id or "").strip()
+        if not uid or not cid:
+            return
+        topic_ids: list = [topic_id] if topic_id is not None else []
+        if topic_id is not None and ObjectId.is_valid(str(topic_id)):
+            oid = ObjectId(str(topic_id))
+            if oid not in topic_ids:
+                topic_ids.append(oid)
+        if topic_ids:
+            self.topic_progress.update_many(
+                {"userId": uid, "topicId": {"$in": topic_ids}},
+                {"$pull": {"processedConversationIds": cid}},
+            )
+            progress = self.find_progress(uid, topic_id)
+            unset: dict = {}
+            if progress:
+                if str(progress.get("lastProcessedConversationId") or "") == cid:
+                    unset["lastProcessedConversationId"] = ""
+                if str(progress.get("engineEvaluatedConversationId") or "") == cid:
+                    unset["engineEvaluatedConversationId"] = ""
+            if unset:
+                self.topic_progress.update_many(
+                    {"userId": uid, "topicId": {"$in": topic_ids}},
+                    {"$unset": unset},
+                )
+        self.user_profile_memory.update_one(
+            {"userId": uid},
+            {"$pull": {"processedConversationIds": cid}},
+        )
+        profile = self.user_profile_memory.find_one({"userId": uid})
+        profile_unset: dict = {}
+        if profile and str(profile.get("lastProcessedConversationId") or "") == cid:
+            profile_unset["lastProcessedConversationId"] = ""
+            profile_unset["profileMemoryMetadata.lastProcessedConversationId"] = ""
+        if profile_unset:
+            self.user_profile_memory.update_one({"userId": uid}, {"$unset": profile_unset})
+        self.learning_memory.update_one(
+            {"userId": uid},
+            {"$pull": {"processedConversationIds": cid}},
+        )
+        learning = self.learning_memory.find_one({"userId": uid})
+        learning_unset: dict = {}
+        if learning:
+            if str(learning.get("sourceConversationId") or "") == cid:
+                learning_unset["sourceConversationId"] = ""
+            meta = learning.get("metadata") if isinstance(learning.get("metadata"), dict) else {}
+            last = str(
+                meta.get("lastAnalyzedConversationId")
+                or meta.get("lastProcessedConversationId")
+                or ""
+            )
+            if last == cid:
+                learning_unset["metadata.lastAnalyzedConversationId"] = ""
+                learning_unset["metadata.lastProcessedConversationId"] = ""
+        if learning_unset:
+            self.learning_memory.update_one({"userId": uid}, {"$unset": learning_unset})
+
     def insert_conversation_session(self, doc: dict) -> dict:
         payload = dict(doc)
         result = self.conversation_sessions.insert_one(payload)
@@ -651,7 +719,13 @@ class MongoStore:
     def upsert_memory_metadata(self, doc: dict) -> dict:
         from datetime import datetime, timezone
 
-        payload = dict(doc)
+        payload = _without_none(dict(doc))
+        allowed = set(
+            S.COLLECTION_VALIDATORS[S.MEMORY_METADATA]["$jsonSchema"]["properties"]
+        )
+        payload = {
+            key: value for key, value in payload.items() if key in allowed or key == "_id"
+        }
         now = datetime.now(timezone.utc)
         payload["updatedAt"] = payload.get("updatedAt") or now
         created_at = payload.pop("createdAt", None) or now

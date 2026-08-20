@@ -314,6 +314,7 @@ def test_invalid_json_does_not_store_corrupted_summary():
     with pytest.raises(SummaryGenerationFailed) as exc:
         svc.generateConversationSummary(cid, userId="u1")
     assert exc.value.code == "SUMMARY_GENERATION_FAILED"
+    assert analyzer.calls == 3
     stored = repo.find_conversation_summary(cid)
     assert stored is None or stored.get("summaryStatus") == "FAILED"
     assert stored is None or not stored.get("goals")
@@ -329,6 +330,7 @@ def test_llm_failure_keeps_session_completed():
     with pytest.raises(SummaryGenerationFailed) as exc:
         svc.generateConversationSummary(cid, userId="u1")
     assert exc.value.code == "SUMMARY_GENERATION_FAILED"
+    assert analyzer.calls == 3
     assert repo.sessions[0]["status"] == "COMPLETED"
     stored = repo.find_conversation_summary(cid)
     assert stored is not None
@@ -351,3 +353,109 @@ def test_user_cannot_generate_or_read_another_users_summary():
     assert read_exc.value.code == "CONVERSATION_ACCESS_DENIED"
     owned = svc.getConversationSummary(cid, "u1")
     assert owned["conversationId"] == cid
+
+
+def test_invalid_goal_status_does_not_fail_summary():
+    repo = FakeRepo()
+    analyzer = FakeAnalyzer(
+        _analysis(
+            goals=[
+                {
+                    "goalId": "name",
+                    "status": "DONE",
+                    "evidence": "User introduced himself as Aayush.",
+                },
+                {
+                    "goalId": "location",
+                    "status": "maybe later",
+                    "evidence": "",
+                },
+            ]
+        )
+    )
+    svc = ConversationSummaryService(repo, analyzer=analyzer)
+    cid = _seed(repo)
+
+    saved = svc.generateConversationSummary(cid, userId="u1")
+
+    assert saved["summaryStatus"] == "COMPLETED"
+    by_id = {row["goalId"]: row["status"] for row in saved["goals"]}
+    assert by_id["name"] == "COMPLETED"
+    assert by_id["location"] == "NOT_ATTEMPTED"
+    assert by_id["hobbies"] == "NOT_ATTEMPTED"
+
+
+def test_empty_llm_summary_uses_transcript_fallback():
+    repo = FakeRepo()
+    analyzer = FakeAnalyzer(_analysis(summary="   "))
+    svc = ConversationSummaryService(repo, analyzer=analyzer)
+    cid = _seed(repo, messages=[("user", "Hi, my name is Aayush.")])
+
+    saved = svc.generateConversationSummary(cid, userId="u1")
+
+    assert saved["summaryStatus"] == "COMPLETED"
+    assert "Aayush" in saved["summary"]
+
+
+def test_analyzer_recovers_after_transient_failure():
+    repo = FakeRepo()
+    analyzer = FakeAnalyzer()
+    calls = {"n": 0}
+
+    def _flaky(*, system: str, user: str):
+        calls["n"] += 1
+        analyzer.calls += 1
+        if calls["n"] == 1:
+            raise RuntimeError("temporary llm timeout")
+        return _analysis()
+
+    analyzer.analyze_json = _flaky  # type: ignore[method-assign]
+    svc = ConversationSummaryService(repo, analyzer=analyzer)
+    cid = _seed(repo)
+
+    saved = svc.generateConversationSummary(cid, userId="u1")
+
+    assert saved["summaryStatus"] == "COMPLETED"
+    assert analyzer.calls == 2
+
+
+def test_hollow_analysis_is_not_stored_as_completed():
+    repo = FakeRepo()
+    analyzer = FakeAnalyzer(
+        _analysis(
+            summary="   ",
+            keyPoints=[],
+            goals=[],
+            mistakes=[],
+            corrections=[],
+            strengths=[],
+            weaknesses=[],
+            importantFacts=[],
+            vocabulary=[],
+            grammarPatterns=[],
+            fluencyObservations=[],
+        )
+    )
+    svc = ConversationSummaryService(repo, analyzer=analyzer)
+    cid = _seed(repo)
+
+    with pytest.raises(SummaryGenerationFailed) as exc:
+        svc.generateConversationSummary(cid, userId="u1")
+    assert exc.value.code == "SUMMARY_GENERATION_FAILED"
+    stored = repo.find_conversation_summary(cid)
+    assert stored is None or stored.get("summaryStatus") == "FAILED"
+    assert stored is None or not stored.get("summary")
+
+
+def test_force_regenerates_completed_summary():
+    repo = FakeRepo()
+    analyzer = FakeAnalyzer(_analysis(summary="First pass with little detail."))
+    svc = ConversationSummaryService(repo, analyzer=analyzer)
+    cid = _seed(repo)
+    first = svc.generateConversationSummary(cid, userId="u1")
+    analyzer.payload = _analysis(summary="Learner described a concrete future goal.")
+    skipped = svc.generateConversationSummary(cid, userId="u1")
+    forced = svc.generateConversationSummary(cid, userId="u1", force=True)
+    assert skipped["summary"] == first["summary"]
+    assert forced["summary"] == "Learner described a concrete future goal."
+    assert analyzer.calls == 2

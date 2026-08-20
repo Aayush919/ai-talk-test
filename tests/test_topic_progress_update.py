@@ -495,3 +495,73 @@ def test_concurrent_processing_updates_once():
     assert repo.progress[0]["attemptCount"] == 1
     assert repo.progress[0]["goalsCompleted"] == ["introduce_self"]
     assert repo.progress[0]["goalsCompleted"].count("introduce_self") == 1
+
+
+def test_practiced_call_updates_each_topic_and_keeps_current_in_progress():
+    repo = FakeRepo()
+    repo.topics = [
+        _topic(),
+        {
+            "_id": "t2",
+            "title": "Daily Routine",
+            "slug": "a1-daily-routine",
+            "level": "A1",
+            "order": 2,
+            "isActive": True,
+            "goals": [
+                {"key": "wake_up", "description": "wake"},
+                {"key": "morning", "description": "morning"},
+            ],
+        },
+        {
+            "_id": "t3",
+            "title": "Family",
+            "slug": "a1-family",
+            "level": "A1",
+            "order": 3,
+            "isActive": True,
+            "goals": [{"key": "family_members", "description": "family"}],
+        },
+    ]
+    svc = TopicProgressService(repo)
+    svc.getOrInitializeCurrentTopic("u1")
+    cid = uuid4().hex
+    repo.sessions.append(
+        {
+            "_id": cid,
+            "userId": "u1",
+            "topicId": "t1",
+            "status": "COMPLETED",
+        }
+    )
+    snapshot = {
+        "topicId": "t2",
+        "goalsCompleted": ["wake_up"],
+        "goalsRemaining": ["morning"],
+        "practicedTopics": [
+            {
+                "topicId": "t1",
+                "goalsCompleted": [
+                    "introduce_self",
+                    "talk_about_work",
+                    "talk_about_hobbies",
+                    "talk_about_background",
+                    "talk_about_goals",
+                ],
+                "goalsRemaining": [],
+                "status": "COMPLETED",
+            }
+        ],
+    }
+    rows = svc.updateFromPracticedCall(cid, snapshot, userId="u1")
+    assert len(rows) == 2
+    intro = repo.find_progress("u1", "t1")
+    daily = repo.find_progress("u1", "t2")
+    family = repo.find_progress("u1", "t3")
+    assert intro["status"] == "COMPLETED"
+    assert intro["progress"] == 100
+    assert daily["status"] == "IN_PROGRESS"
+    assert daily["goalsCompleted"] == ["wake_up"]
+    assert daily["progress"] == 50
+    assert family["status"] == "NOT_STARTED"
+    assert repo.find_in_progress("u1")["topicId"] == "t2"

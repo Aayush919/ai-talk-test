@@ -14,9 +14,10 @@ Rules:
 1. Analyze only what the learner actually said.
 2. Never invent user facts.
 3. Do not treat an AI question as evidence that the learner completed a goal.
-4. A goal is COMPLETED only when the learner meaningfully demonstrates it.
-5. Use PARTIAL when the learner attempted the goal but the evidence is incomplete.
-6. Use NOT_ATTEMPTED when the goal was not meaningfully practiced.
+4. A goal is COMPLETED when the learner meaningfully demonstrates it in their own words.
+   Grammar mistakes do not block COMPLETED.
+5. Use PARTIAL only when the learner started the goal but never actually expressed the idea.
+6. Use NOT_ATTEMPTED when the goal was not practiced.
 7. Identify useful English mistakes, not every tiny stylistic difference.
 8. Provide clear corrections.
 9. Extract only useful vocabulary.

@@ -151,6 +151,7 @@ class ConversationRuntimeState(BaseModel):
     lastAssistantQuestion: str | None = None
     lastUserAnswer: str | None = None
     pendingGoalEvidence: dict[str, Any] | None = None
+    practicedTopics: list[dict[str, Any]] = Field(default_factory=list)
     callBoard: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -203,6 +204,7 @@ class RuntimeStateDict(TypedDict, total=False):
     correctionState: dict[str, Any]
     pendingGoalEvidence: dict[str, Any] | None
     callBoard: dict[str, Any]
+    practicedTopics: list[dict[str, Any]]
     sttConfidence: float | None
     incomingSttConfidence: float | None
     pronunciationEvidence: bool
@@ -237,6 +239,9 @@ PUBLIC_KEYS = (
     "lastAssistantQuestion",
     "lastUserAnswer",
     "pendingGoalEvidence",
+    "topicGoals",
+    "practicedTopics",
+    "callBoard",
 )
 
 

@@ -27,13 +27,16 @@ from core.conversation.response import (
     coerce_spoken_text,
     decision_from_spoken,
     extract_question,
+    is_similar_question,
     parse_ai_response,
     question_key,
+    rewrite_repeated_question,
     spoken_text_only,
 )
 from core.conversation.session_board import (
     allow_goal_switch,
     empty_call_board,
+    next_goal_question,
     pin_session_goals,
     update_call_board,
 )
@@ -306,6 +309,7 @@ class RuntimeGraph:
             "turnOutcome": None,
             "lastDecision": None,
             "callBoard": empty_call_board(),
+            "practicedTopics": [],
         }
         validate_runtime_state(loaded)
         return loaded
@@ -357,6 +361,7 @@ class RuntimeGraph:
             "shouldContinue": True,
             "runtimeMode": "ready",
             "callBoard": dict(state.get("callBoard") or empty_call_board()),
+            "practicedTopics": list(state.get("practicedTopics") or []),
             "contextSession": None,
             "contextTopic": None,
             "contextProgress": None,
@@ -408,7 +413,7 @@ class RuntimeGraph:
             limit=self.conversation_config.max_entities,
         )
         context = dict(state.get("userContext") or {})
-        skip_slots = user_intent in {"MEMORY_PROBE", "CONFUSION", "REPEAT_COMPLAINT"}
+        skip_slots = user_intent in {"MEMORY_PROBE", "CONFUSION"}
         incoming_facts = [] if skip_slots else extract_live_facts(text)
         facts = merge_live_facts(
             context.get("profileFacts") or [],
@@ -426,7 +431,7 @@ class RuntimeGraph:
             board=state.get("callBoard"),
             user_text=text,
             topic_goals=list(state.get("topicGoals") or []),
-            current_goal_id=goals.get("currentGoalId") or state.get("currentGoalId"),
+            current_goal_id=state.get("currentGoalId"),
             last_question=state.get("lastAssistantQuestion"),
             skip_slots=skip_slots,
         )
@@ -436,13 +441,30 @@ class RuntimeGraph:
             goals_remaining=goals["goalsRemaining"],
             board=board,
         )
+        switched: dict[str, Any] = {}
+        try:
+            switched = self._advance_live_topic(state, pinned, board)
+        except Exception as exc:  # noqa: BLE001
+            call_log.warn(
+                "RUNTIME",
+                f"live topic switch skip: {type(exc).__name__}",
+                extra={"err": str(exc)[:240]},
+            )
+        if switched:
+            pinned = {
+                "goalsCompleted": switched.get("goalsCompleted", pinned["goalsCompleted"]),
+                "goalsRemaining": switched.get("goalsRemaining", pinned["goalsRemaining"]),
+                "currentGoalId": switched.get("currentGoalId", pinned["currentGoalId"]),
+                "currentGoalIndex": switched.get("currentGoalIndex", pinned["currentGoalIndex"]),
+            }
+            board = switched.get("callBoard") or board
         correction_state = resolve_awaiting_repeat(
             state.get("correctionState"),
             user_text=text,
             user_intent=user_intent,
         )
         correction_state["correctionsGivenThisTurn"] = 0
-        return {
+        out = {
             "lastUserMessage": text or None,
             "lastUserAnswer": text or None,
             "lastUserIntent": user_intent,
@@ -465,6 +487,21 @@ class RuntimeGraph:
             },
             "pendingMemorySignals": [],
         }
+        for key in (
+            "practicedTopics",
+            "topicId",
+            "topicTitle",
+            "topicLevel",
+            "topicStatus",
+            "topicProgress",
+            "topicGoals",
+            "topicPlan",
+            "recentQuestions",
+            "lastAssistantQuestion",
+        ):
+            if key in switched:
+                out[key] = switched[key]
+        return out
 
     def update_runtime_state(self, state: RuntimeStateDict) -> dict[str, Any]:
         messages = [
@@ -488,8 +525,13 @@ class RuntimeGraph:
 
     def generate_response(self, state: RuntimeStateDict) -> dict[str, Any]:
         user_text = _trim(state.get("lastUserMessage"))
-        decision, llm_ms = self._decide(state, user_text)
         user_intent = _trim(state.get("lastUserIntent")) or "ANSWER"
+        if user_intent == "REPEAT_COMPLAINT":
+            canned = next_goal_question(state)
+            spoken = f"You're right, you already told me. {canned}"
+            decision, llm_ms = decision_from_spoken(spoken, user_intent=user_intent), 0
+        else:
+            decision, llm_ms = self._decide(state, user_text)
         stt = state.get("sttConfidence")
         try:
             stt_value = float(stt) if stt is not None else None
@@ -517,6 +559,18 @@ class RuntimeGraph:
             for item in (state.get("recentQuestions") or [])
             if str(item).strip()
         ]
+        previous_questions = list(recent_questions)
+        last_asked = _trim(state.get("lastAssistantQuestion"))
+        if last_asked:
+            previous_questions.append(last_asked)
+        if question and self._is_repeat_question(question, previous_questions):
+            canned = next_goal_question(state)
+            if canned and not is_similar_question(question, canned):
+                reply = rewrite_repeated_question(reply, question, canned)
+                decision["text"] = reply
+                decision["response"] = reply
+                question = canned
+                decision["question"] = canned
         if question and question_key(question) not in {question_key(item) for item in recent_questions}:
             recent_questions.append(question)
         recent_questions = recent_questions[-self.conversation_config.max_recent_questions :]
@@ -590,6 +644,124 @@ class RuntimeGraph:
 
     def end_runtime(self, state: RuntimeStateDict) -> dict[str, Any]:
         return {"shouldContinue": False, "runtimeMode": "ended"}
+
+    def _is_repeat_question(self, question: str, previous: list[str]) -> bool:
+        asked = _trim(question)
+        if not asked:
+            return False
+        for item in previous:
+            if question_key(asked) == question_key(item) or is_similar_question(asked, item):
+                return True
+        return False
+
+    def _advance_live_topic(
+        self,
+        state: RuntimeStateDict,
+        pinned: dict[str, Any],
+        board: dict[str, Any],
+    ) -> dict[str, Any]:
+        remaining = list(pinned.get("goalsRemaining") or [])
+        if remaining:
+            return {}
+        completed = list(pinned.get("goalsCompleted") or [])
+        answered = dict((board or {}).get("answered") or {})
+        if not completed or not answered:
+            return {}
+        snapshot = {
+            "topicId": str(state.get("topicId") or ""),
+            "topicTitle": _trim(state.get("topicTitle")),
+            "topicLevel": _trim(state.get("topicLevel")) or None,
+            "goalsCompleted": completed,
+            "goalsRemaining": [],
+            "progress": 100,
+            "status": "COMPLETED",
+        }
+        practiced = [
+            dict(item)
+            for item in (state.get("practicedTopics") or [])
+            if isinstance(item, dict) and str(item.get("topicId") or "")
+        ]
+        practiced = [
+            item
+            for item in practiced
+            if str(item.get("topicId")) != snapshot["topicId"]
+        ]
+        if snapshot["topicId"]:
+            practiced.append(snapshot)
+        nxt = self._next_curriculum_topic(state, practiced)
+        if nxt is None:
+            return {
+                "practicedTopics": practiced,
+                "topicStatus": "COMPLETED",
+                "topicProgress": 100,
+                "goalsRemaining": [],
+                "callBoard": empty_call_board(),
+            }
+        records = _goal_records(nxt)
+        keys = [item["key"] for item in records]
+        call_log.info(
+            "RUNTIME",
+            "live_topic_switch",
+            extra={
+                "fromTopicId": snapshot["topicId"],
+                "toTopicId": str(nxt.get("_id") or ""),
+            },
+        )
+        return {
+            "practicedTopics": practiced,
+            "topicId": str(nxt.get("_id") or ""),
+            "topicTitle": _trim(nxt.get("title")),
+            "topicLevel": _trim(nxt.get("level")) or state.get("topicLevel"),
+            "topicStatus": "IN_PROGRESS",
+            "topicProgress": 0,
+            "topicGoals": records,
+            "goalsCompleted": [],
+            "goalsRemaining": keys,
+            "currentGoalId": keys[0] if keys else None,
+            "currentGoalIndex": 0 if keys else None,
+            "callBoard": empty_call_board(),
+            "recentQuestions": [],
+            "lastAssistantQuestion": None,
+            "topicPlan": {
+                "action": "NEXT",
+                "shouldContinueTopic": True,
+                "currentGoalDescription": records[0]["description"] if records else "",
+            },
+        }
+
+    def _next_curriculum_topic(
+        self,
+        state: RuntimeStateDict,
+        practiced: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        level = _trim(state.get("topicLevel"))
+        lister = getattr(self.repo, "list_active_topics", None)
+        if not callable(lister) or not level:
+            return None
+        skip_ids = {str(state.get("topicId") or "")}
+        skip_ids.update(str(item.get("topicId") or "") for item in practiced)
+        user_id = _trim(state.get("userId"))
+        finder = getattr(self.repo, "find_progress", None)
+        seen_current = False
+        for topic in lister(level) or []:
+            tid = str(topic.get("_id") or "")
+            if tid == str(state.get("topicId") or ""):
+                seen_current = True
+                continue
+            if not seen_current:
+                continue
+            if not tid or tid in skip_ids:
+                continue
+            row = None
+            if callable(finder) and user_id:
+                try:
+                    row = finder(user_id, topic.get("_id"))
+                except Exception:  # noqa: BLE001
+                    row = None
+            if row and str(row.get("status") or "").upper() == "COMPLETED":
+                continue
+            return topic
+        return None
 
     def _decide(self, state: dict[str, Any], user_text: str) -> tuple[dict[str, Any], int]:
         if self.analyzer is None:

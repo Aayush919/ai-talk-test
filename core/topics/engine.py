@@ -106,16 +106,8 @@ def topic_meets_completion(
     ]
     if len(completed) >= len(keys):
         return True
-    if not use_criteria:
-        return False
-    criteria = (topic or {}).get("completionCriteria") or {}
-    minimum = int(criteria.get("minimumGoals") or len(keys))
-    if len(completed) < min(minimum, len(keys)):
-        return False
-    min_seconds = criteria.get("minimumConversationSeconds")
-    if min_seconds and duration_seconds is not None:
-        return int(duration_seconds) >= int(min_seconds)
-    return True
+    _ = duration_seconds, use_criteria
+    return False
 
 
 def start_action(progress: dict[str, Any] | None) -> str:

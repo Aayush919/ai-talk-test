@@ -624,7 +624,12 @@ class LiveCallBridge:
         if not cid or svc is None:
             return
         runtime = self.conversation_runtime
+        runtime_snapshot = None
         if runtime is not None:
+            try:
+                runtime_snapshot = await asyncio.to_thread(runtime.getRuntimeState, cid)
+            except Exception as exc:  # noqa: BLE001
+                call_log.warn("RUNTIME", f"snapshot skip: {exc}", session_id=self._sid())
             try:
                 await asyncio.to_thread(runtime.endConversationRuntime, cid)
             except Exception as exc:  # noqa: BLE001
@@ -672,6 +677,7 @@ class LiveCallBridge:
                         profile_service=self.profile_memory,
                         learning_service=self.learning_memory,
                         semantic_service=self.semantic_memory,
+                        runtime_snapshot=runtime_snapshot,
                     ),
                     name="conversation-summary",
                 )
@@ -807,12 +813,22 @@ class LiveCallBridge:
             self._hold_playback(text)
 
     async def _drain_persist_tasks(self) -> None:
+        chain = self._persist_chain
+        if chain is not None and not chain.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(chain), timeout=10.0)
+            except asyncio.TimeoutError:
+                call_log.warn(
+                    "MESSAGE",
+                    "persist still running at hangup",
+                    session_id=self._sid(),
+                )
+            except Exception:
+                pass
         pending = [task for task in self._persist_tasks if not task.done()]
         if not pending:
             return
-        _done, still = await asyncio.wait(pending, timeout=2.0)
-        for task in still:
-            task.cancel()
+        await asyncio.wait(pending, timeout=2.0)
 
     async def run(self) -> None:
         await self.ws.accept()

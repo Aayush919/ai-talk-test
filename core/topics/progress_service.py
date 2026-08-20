@@ -275,6 +275,122 @@ class TopicProgressService:
         except Exception as exc:  # noqa: BLE001
             raise TopicProgressUpdateFailed() from exc
 
+    def updateFromPracticedCall(
+        self,
+        conversationId: str,
+        runtime_snapshot: dict[str, Any] | None,
+        *,
+        userId: str | None = None,
+    ) -> list[dict[str, Any]]:
+        cid = str(conversationId or "").strip()
+        if not cid:
+            raise ConversationNotFound()
+        owner = str(userId or "").strip() or None
+        session = self.repo.find_conversation_session(cid)
+        if session is None:
+            raise ConversationNotFound()
+        if owner and str(session.get("userId") or "") != owner:
+            raise ConversationAccessDenied()
+        if session.get("status") != COMPLETED:
+            raise ConversationNotCompleted()
+        user_id = str(session.get("userId") or "").strip()
+        if not user_id:
+            raise UserNotFound()
+        rows = self._snapshots_from_runtime(runtime_snapshot, session)
+        if not rows:
+            raise TopicProgressUpdateFailed()
+        if self.repo.find_progress(user_id, rows[0].get("topicId")) is None:
+            self.getOrInitializeCurrentTopic(user_id)
+        results: list[dict[str, Any]] = []
+        last_complete: dict[str, Any] | None = None
+        all_complete = True
+        for snap in rows:
+            topic_id = snap.get("topicId")
+            topic = self.repo.find_topic(topic_id)
+            if topic is None:
+                continue
+            goal_keys = _goal_keys(topic)
+            if not goal_keys:
+                continue
+            progress = self.repo.find_progress(user_id, topic_id)
+            if progress is None:
+                continue
+            newly = {
+                str(item)
+                for item in (snap.get("goalsCompleted") or [])
+                if str(item) in set(goal_keys)
+            }
+            previous_completed = {
+                str(item)
+                for item in (progress.get("goalsCompleted") or [])
+                if str(item) in set(goal_keys)
+            }
+            completed = [key for key in goal_keys if key in previous_completed or key in newly]
+            remaining = [key for key in goal_keys if key not in set(completed)]
+            percent = int(round((len(completed) / len(goal_keys)) * 100))
+            previous_status = str(progress.get("status") or NOT_STARTED)
+            now = _utc_now()
+            if previous_status == COMPLETED or percent >= 100:
+                status = COMPLETED
+                completed_at = progress.get("completedAt") or now
+            else:
+                status = IN_PROGRESS
+                completed_at = None
+                all_complete = False
+            started_at = progress.get("startedAt") or now
+            fields = {
+                "status": status,
+                "progress": percent,
+                "goalsCompleted": completed,
+                "goalsRemaining": remaining,
+                "lastConversationId": cid,
+                "lastProcessedConversationId": cid,
+                "lastProcessedAt": now,
+                "startedAt": started_at,
+                "completedAt": completed_at,
+                "updatedAt": now,
+            }
+            updated = self.repo.apply_progress_from_conversation(
+                user_id, topic_id, cid, fields
+            )
+            final = updated or self.repo.find_progress(user_id, topic_id) or progress
+            results.append(self._public_progress(final, topic))
+            if status == COMPLETED:
+                last_complete = final
+        if all_complete and last_complete is not None:
+            try:
+                from core.topics.engine import TopicEngine
+
+                TopicEngine(self.repo, progress=self)._advance_after_complete(
+                    user_id, last_complete
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return results
+
+    def _snapshots_from_runtime(
+        self,
+        runtime_snapshot: dict[str, Any] | None,
+        session: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        snapshot = runtime_snapshot or {}
+        practiced = [
+            dict(item)
+            for item in (snapshot.get("practicedTopics") or [])
+            if isinstance(item, dict) and item.get("topicId")
+        ]
+        current_id = str(snapshot.get("topicId") or session.get("topicId") or "")
+        seen = {str(item.get("topicId")) for item in practiced}
+        if current_id and current_id not in seen:
+            practiced.append(
+                {
+                    "topicId": current_id,
+                    "goalsCompleted": list(snapshot.get("goalsCompleted") or []),
+                    "goalsRemaining": list(snapshot.get("goalsRemaining") or []),
+                }
+            )
+        return practiced
+
     def getPracticePlan(self, user_id: str) -> dict[str, Any]:
         from core.topics.engine import TopicEngine
 

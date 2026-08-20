@@ -170,7 +170,7 @@ class GroqCoach:
                     self.model,
                     messages,
                     timeout=self.post_call_timeout,
-                    max_tokens=1800,
+                    max_tokens=4096,
                     json_mode=True,
                 )
             except Exception:
@@ -179,7 +179,7 @@ class GroqCoach:
                     self.model,
                     messages,
                     timeout=self.post_call_timeout,
-                    max_tokens=1800,
+                    max_tokens=4096,
                     json_mode=False,
                 )
             return parse_json_object(raw)

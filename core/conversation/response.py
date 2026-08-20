@@ -63,6 +63,39 @@ def question_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _trim(text).lower()).strip()
 
 
+_QUESTION_STOP = frozenset(
+    """
+    do you what when where why how the a an to in on of your usually can
+    tell me please about a bit little more also and or so okay
+    """.split()
+)
+
+
+def is_similar_question(left: str, right: str) -> bool:
+    a = {part for part in question_key(left).split() if part not in _QUESTION_STOP}
+    b = {part for part in question_key(right).split() if part not in _QUESTION_STOP}
+    if not a or not b:
+        return bool(question_key(left)) and question_key(left) == question_key(right)
+    overlap = len(a & b)
+    if overlap >= 2:
+        return True
+    return overlap / len(a | b) >= 0.5
+
+
+def rewrite_repeated_question(reply: str, old_question: str, new_question: str) -> str:
+    spoken = _trim(reply)
+    previous = _trim(old_question)
+    nxt = _trim(new_question)
+    if not nxt:
+        return spoken
+    if previous and previous in spoken:
+        return spoken.replace(previous, nxt, 1)
+    stripped = re.sub(r"[^.!?]*\?\s*$", "", spoken).strip()
+    if stripped:
+        return f"{stripped} {nxt}"
+    return nxt
+
+
 def generateNextQuestion(context: dict[str, Any], decision: dict[str, Any] | None = None) -> dict[str, Any]:
     """Use the already-generated turn. Never starts a second LLM call."""
     decision = decision or {}
